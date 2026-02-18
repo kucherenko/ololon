@@ -8,6 +8,7 @@ mod db;
 mod server;
 mod train;
 mod trade;
+mod validate;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -134,6 +135,13 @@ enum Commands {
         #[arg(long, env = "OLOLON_BIND_ADDRESS", default_value = "0.0.0.0:3000")]
         bind_address: String,
     },
+
+    /// Validate trained model against all labeled data in database
+    Validate {
+        /// Hidden size for LSTM inference (must match trained model)
+        #[arg(long, env = "OLOLON_HIDDEN_SIZE", default_value = "64")]
+        hidden_size: usize,
+    },
 }
 
 #[tokio::main]
@@ -225,6 +233,14 @@ async fn main() -> anyhow::Result<()> {
                 db_path: cli.database,
                 auth_token,
                 bind_address,
+            })
+            .await?;
+        }
+        Commands::Validate { hidden_size } => {
+            validate::run(validate::ValidateConfig {
+                db_path: cli.database,
+                model_path: cli.model,
+                hidden_size,
             })
             .await?;
         }
