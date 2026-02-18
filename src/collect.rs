@@ -501,7 +501,7 @@ pub async fn run(config: Config) -> Result<()> {
                                     start_price: completed.start_price,
                                     end_price,
                                     feature_vector: features,
-                                    num_points: num_points,
+                                    num_points,
                                 });
                                 // Remember this window for target update
                                 *last_saved_window_start.write().await = Some(completed.time_range_start);

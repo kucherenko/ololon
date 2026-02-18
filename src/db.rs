@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use ormlite::model::*;
+use ormlite::query_builder::OnConflict;
 use ormlite::sqlite::SqliteConnection;
 use ormlite::{Connection, Executor};
 use serde::{Deserialize, Serialize};
@@ -135,7 +136,7 @@ pub struct Trade {
 /// Model training metadata
 #[allow(dead_code)]
 #[derive(Debug, Clone, Model, Serialize, Deserialize)]
-#[ormlite(table = "model_metadata")]
+#[ormlite(table = "model_metadata", insert = "InsertModelMetadata")]
 pub struct ModelMetadata {
     #[ormlite(primary_key)]
     pub id: i64,
@@ -159,28 +160,19 @@ pub async fn insert_feature(
     feature_vector: Vec<f64>,
     num_points: usize,
 ) -> Result<Feature> {
-    let result = ormlite::query(
-        r#"INSERT INTO features (time_range_start, time_range_end, start_price, feature_vector, num_points) 
-           VALUES (?1, ?2, ?3, ?4, ?5)"#,
-    )
-    .bind(time_range_start)
-    .bind(time_range_end)
-    .bind(start_price)
-    .bind(serde_json::to_string(&feature_vector)?)
-    .bind(num_points as i32)
-    .execute(&mut *conn)
-    .await?;
-    
-    let id = result.last_insert_rowid();
-    
-    // Fetch the inserted row to return full Feature
-    let feature = Feature::select()
-        .where_("id = ?")
-        .bind(id)
-        .fetch_one(&mut *conn)
-        .await?;
-    
-    Ok(feature)
+    InsertFeature {
+        time_range_start,
+        time_range_end,
+        start_price,
+        end_price: None,
+        feature_vector,
+        target: None,
+        num_points: num_points as i32,
+        labeled_at: None,
+    }
+    .insert(&mut *conn)
+    .await
+    .map_err(Into::into)
 }
 
 /// Apply delayed label to a feature record using the end price
@@ -283,30 +275,27 @@ pub struct TradeRecord {
     pub error_message: Option<String>,
 }
 
-/// Insert a trade record
+/// Insert a trade record using the ORM insert struct
 #[allow(dead_code)]
 pub async fn insert_trade(conn: &mut SqliteConnection, trade: &TradeRecord) -> Result<i64> {
-    let result = ormlite::query(
-        r#"INSERT INTO trades (timestamp, market_id, outcome, predicted_prob, market_prob, 
-           edge, trade_size, avg_price, status, order_id, tx_hash, error_message)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
-    )
-    .bind(trade.timestamp)
-    .bind(&trade.market_id)
-    .bind(&trade.outcome)
-    .bind(trade.predicted_prob)
-    .bind(trade.market_prob)
-    .bind(trade.edge)
-    .bind(trade.trade_size)
-    .bind(trade.avg_price)
-    .bind(&trade.status)
-    .bind(&trade.order_id)
-    .bind(&trade.tx_hash)
-    .bind(&trade.error_message)
-    .execute(conn)
+    let inserted = InsertTrade {
+        timestamp: trade.timestamp,
+        market_id: trade.market_id.clone(),
+        outcome: trade.outcome.clone(),
+        predicted_prob: trade.predicted_prob,
+        market_prob: trade.market_prob,
+        edge: trade.edge,
+        trade_size: trade.trade_size,
+        avg_price: trade.avg_price,
+        status: trade.status.clone(),
+        order_id: trade.order_id.clone(),
+        tx_hash: trade.tx_hash.clone(),
+        error_message: trade.error_message.clone(),
+    }
+    .insert(&mut *conn)
     .await?;
     
-    Ok(result.last_insert_rowid())
+    Ok(inserted.id)
 }
 
 /// Legacy struct for compatibility - ModelMetadataRecord
@@ -323,7 +312,7 @@ pub struct ModelMetadataRecord {
     pub window_duration_secs: i64,
 }
 
-/// Save model metadata after training
+/// Save model metadata after training (upserts on id=1)
 #[allow(clippy::too_many_arguments)]
 pub async fn save_model_metadata(
     conn: &mut SqliteConnection,
@@ -337,21 +326,19 @@ pub async fn save_model_metadata(
 ) -> Result<()> {
     let trained_at = chrono::Utc::now().timestamp();
 
-    // Use raw query for upsert since ormlite's OnConflict might not work with custom constraint
-    ormlite::query(
-        r#"INSERT OR REPLACE INTO model_metadata 
-           (id, model_path, trained_at, epochs, final_train_loss, final_val_loss, hidden_size, num_layers, window_duration_secs)
-           VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-    )
-    .bind(model_path)
-    .bind(trained_at)
-    .bind(epochs as i32)
-    .bind(final_train_loss)
-    .bind(final_val_loss)
-    .bind(hidden_size as i32)
-    .bind(num_layers as i32)
-    .bind(window_duration_secs)
-    .execute(conn)
+    ModelMetadata {
+        id: 1,
+        model_path: model_path.to_string(),
+        trained_at,
+        epochs: epochs as i32,
+        final_train_loss,
+        final_val_loss,
+        hidden_size: hidden_size as i32,
+        num_layers: num_layers as i32,
+        window_duration_secs,
+    }
+    .insert(&mut *conn)
+    .on_conflict(OnConflict::do_update_on_pkey("id"))
     .await?;
 
     Ok(())
@@ -359,12 +346,12 @@ pub async fn save_model_metadata(
 
 /// Get model metadata
 pub async fn get_model_metadata(conn: &mut SqliteConnection) -> Result<Option<(String, i64)>> {
-    let result: Option<(String, i64)> = ormlite::query_as(
-        "SELECT model_path, window_duration_secs FROM model_metadata WHERE id = 1",
-    )
-    .fetch_optional(conn)
-    .await?;
-    Ok(result)
+    let result = ModelMetadata::select()
+        .where_("id = ?")
+        .bind(1i64)
+        .fetch_optional(conn)
+        .await?;
+    Ok(result.map(|m| (m.model_path, m.window_duration_secs)))
 }
 
 // Re-export for backward compatibility
