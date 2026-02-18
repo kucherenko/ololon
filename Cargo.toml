@@ -56,6 +56,14 @@ anyhow = "1"
 async-trait = "0.1"
 tokio-stream = "0.1"
 
+# Web server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+utoipa = "5"
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
 # Numeric
 rust_decimal = { version = "1", features = ["serde"] }
 rust_decimal_macros = "1"

@@ -5,6 +5,7 @@
 
 mod collect;
 mod db;
+mod server;
 mod train;
 mod trade;
 
@@ -122,6 +123,17 @@ enum Commands {
         #[arg(long, env = "POLY_API_SECRET")]
         api_secret: Option<String>,
     },
+
+    /// Start the REST API server with authentication
+    Server {
+        /// Authentication token for API access (required, or set OLOLON_AUTH_TOKEN env var)
+        #[arg(long, env = "OLOLON_AUTH_TOKEN")]
+        auth_token: String,
+
+        /// Address to bind the server to
+        #[arg(long, env = "OLOLON_BIND_ADDRESS", default_value = "0.0.0.0:3000")]
+        bind_address: String,
+    },
 }
 
 #[tokio::main]
@@ -202,6 +214,17 @@ async fn main() -> anyhow::Result<()> {
                 private_key,
                 api_key,
                 api_secret,
+            })
+            .await?;
+        }
+        Commands::Server {
+            auth_token,
+            bind_address,
+        } => {
+            server::run(server::Config {
+                db_path: cli.database,
+                auth_token,
+                bind_address,
             })
             .await?;
         }

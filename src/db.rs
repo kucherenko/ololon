@@ -92,7 +92,7 @@ pub async fn init_db(db_path: &str) -> Result<SqliteConnection> {
 }
 
 /// Feature record for database operations
-#[derive(Debug, Clone, Model, Serialize, Deserialize)]
+#[derive(Debug, Clone, Model, Serialize, Deserialize, utoipa::ToSchema)]
 #[ormlite(table = "features", insert = "InsertFeature")]
 pub struct Feature {
     #[ormlite(primary_key)]
@@ -112,7 +112,7 @@ pub struct Feature {
 
 /// Trade record for database operations (main struct for reads)
 #[allow(dead_code)]
-#[derive(Debug, Clone, Model, Serialize, Deserialize)]
+#[derive(Debug, Clone, Model, Serialize, Deserialize, utoipa::ToSchema)]
 #[ormlite(table = "trades", insert = "InsertTrade")]
 pub struct Trade {
     #[ormlite(primary_key)]
@@ -135,7 +135,7 @@ pub struct Trade {
 
 /// Model training metadata
 #[allow(dead_code)]
-#[derive(Debug, Clone, Model, Serialize, Deserialize)]
+#[derive(Debug, Clone, Model, Serialize, Deserialize, utoipa::ToSchema)]
 #[ormlite(table = "model_metadata", insert = "InsertModelMetadata")]
 pub struct ModelMetadata {
     #[ormlite(primary_key)]
