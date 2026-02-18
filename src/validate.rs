@@ -13,7 +13,6 @@ use burn::record::{FullPrecisionSettings, JsonGzFileRecorder};
 use burn::tensor::backend::Backend;
 use chrono::{TimeZone, Timelike, Utc};
 use std::collections::HashMap;
-use tracing::info;
 
 use crate::db;
 use crate::train::{PriceBatcher, PricePredictor, PricePredictorConfig};
@@ -165,12 +164,11 @@ fn run_inference<B: Backend>(
 
 /// Main entry point
 pub async fn run(config: ValidateConfig) -> Result<()> {
-    info!(
-        db_path = %config.db_path,
-        model_path = %config.model_path,
-        hidden_size = config.hidden_size,
-        "Starting model validation"
-    );
+    println!("Starting model validation");
+    println!("  Database: {}", config.db_path);
+    println!("  Model: {}", config.model_path);
+    println!("  Hidden size: {}", config.hidden_size);
+    println!();
 
     // Initialize database
     let mut conn = db::init_db(&config.db_path).await?;
@@ -184,7 +182,7 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
         anyhow::bail!("No labeled features found in database. Run 'ololon collect' first.");
     }
 
-    info!(total_labeled = labeled_features.len(), "Loaded labeled features from database");
+    println!("Loaded {} labeled features from database\n", labeled_features.len());
 
     // Convert to validation samples
     let samples: Vec<ValidationSample> = labeled_features
@@ -202,10 +200,10 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
     // Determine input size from data
     let max_feature_len = samples.iter().map(|s| s.features.len()).max().unwrap_or(config.hidden_size);
     let input_size = max_feature_len.max(config.hidden_size);
-    info!(input_size, "Using input size for inference");
+    println!("Using input size: {}\n", input_size);
 
     // Load model
-    info!("Loading trained model...");
+    println!("Loading trained model...");
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     let model_config = PricePredictorConfig::new(input_size, config.hidden_size);
     let model = model_config.init::<MyBackend>(&device);
@@ -214,7 +212,7 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
     let model = model.load_file(&config.model_path, &recorder, &device)
         .context("Failed to load model weights. Make sure to train the model first with 'ololon train'")?;
 
-    info!("Model loaded successfully");
+    println!("Model loaded successfully\n");
 
     // Run inference
     let batcher = PriceBatcher::<MyBackend>::new(device, input_size);
@@ -306,117 +304,74 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
 
     let total_samples = predictions.len();
 
-    // Log comprehensive statistics
-    info!("╔════════════════════════════════════════════════════════════════╗");
-    info!("║                    VALIDATION RESULTS                          ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    // Print comprehensive statistics
+    println!();
+    println!("=== VALIDATION RESULTS ===");
+    println!();
     
     // Overall metrics
-    info!("║ OVERALL PERFORMANCE                                            ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!(
-        "║ Total samples validated: {:>38} ║",
-        total_samples
-    );
-    info!(
-        "║ Accuracy:             {:>8.2}%                            ║",
-        confusion.accuracy() * 100.0
-    );
-    info!(
-        "║ Precision:            {:>8.4}                             ║",
-        confusion.precision()
-    );
-    info!(
-        "║ Recall (Sensitivity): {:>8.4}                             ║",
-        confusion.recall()
-    );
-    info!(
-        "║ Specificity:          {:>8.4}                             ║",
-        confusion.specificity()
-    );
-    info!(
-        "║ F1 Score:             {:>8.4}                             ║",
-        confusion.f1_score()
-    );
+    println!("OVERALL PERFORMANCE");
+    println!("  Total samples: {}", total_samples);
+    println!("  Accuracy:       {:8.2}%", confusion.accuracy() * 100.0);
+    println!("  Precision:      {:8.4}", confusion.precision());
+    println!("  Recall:         {:8.4}", confusion.recall());
+    println!("  Specificity:    {:8.4}", confusion.specificity());
+    println!("  F1 Score:       {:8.4}", confusion.f1_score());
+    println!();
 
     // Confusion matrix
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ CONFUSION MATRIX                                               ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║                        Actual                                   ║");
-    info!("║                    UP ({:>5})    DOWN ({:>5})             ║", up_total, down_total);
-    info!(
-        "║ Predicted UP    {:>8}      {:>8}               ║",
+    println!("CONFUSION MATRIX");
+    println!("                    Actual");
+    println!("                UP ({:>5})    DOWN ({:>5})", up_total, down_total);
+    println!(
+        "  Predicted UP    {:>8}      {:>8}",
         confusion.true_positives,
         confusion.false_positives
     );
-    info!(
-        "║ Predicted DOWN  {:>8}      {:>8}               ║",
+    println!(
+        "  Predicted DOWN  {:>8}      {:>8}",
         confusion.false_negatives,
         confusion.true_negatives
     );
+    println!();
 
     // Class breakdown
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ CLASS BREAKDOWN                                                ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    println!("CLASS BREAKDOWN");
     let up_accuracy = if up_total > 0 { up_correct as f64 / up_total as f64 * 100.0 } else { 0.0 };
     let down_accuracy = if down_total > 0 { down_correct as f64 / down_total as f64 * 100.0 } else { 0.0 };
-    info!(
-        "║ UP predictions:    {:>5}/{:<5} correct ({:>6.2}%)          ║",
-        up_correct, up_total, up_accuracy
-    );
-    info!(
-        "║ DOWN predictions:  {:>5}/{:<5} correct ({:>6.2}%)          ║",
-        down_correct, down_total, down_accuracy
-    );
+    println!("  UP predictions:    {:>5}/{:<5} correct ({:>6.2}%)", up_correct, up_total, up_accuracy);
+    println!("  DOWN predictions:  {:>5}/{:<5} correct ({:>6.2}%)", down_correct, down_total, down_accuracy);
+    println!();
 
     // Time range
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ TIME RANGE                                                     ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    println!("TIME RANGE");
     if let Some(first) = samples.first() {
-        info!(
-            "║ First sample:  {:>48} ║",
-            format_timestamp(first.time_range_start)
-        );
+        println!("  First sample: {}", format_timestamp(first.time_range_start));
     }
     if let Some(last) = samples.last() {
-        info!(
-            "║ Last sample:   {:>48} ║",
-            format_timestamp(last.time_range_start)
-        );
+        println!("  Last sample:  {}", format_timestamp(last.time_range_start));
     }
     let time_span_hours = if let (Some(first), Some(last)) = (samples.first(), samples.last()) {
         (last.time_range_start - first.time_range_start) as f64 / 3600.0
     } else {
         0.0
     };
-    info!(
-        "║ Time span:     {:>12.2} hours ({:.1} days)               ║",
-        time_span_hours,
-        time_span_hours / 24.0
-    );
+    println!("  Time span:    {:.2} hours ({:.1} days)", time_span_hours, time_span_hours / 24.0);
+    println!();
 
     // Probability calibration
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ PROBABILITY CALIBRATION                                        ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ Range        Count    Correct   Accuracy                       ║");
+    println!("PROBABILITY CALIBRATION");
+    println!("  Range         Count    Correct   Accuracy");
     for (i, (count, correct)) in prob_bins.iter().zip(prob_correct_bins.iter()).enumerate() {
         let accuracy = if *count > 0 { *correct as f64 / *count as f64 * 100.0 } else { 0.0 };
         let lower = i as f64 / 10.0;
         let upper = (i + 1) as f64 / 10.0;
-        info!(
-            "║ [{:.1}-{:.1}]    {:>5}      {:>5}    {:>6.2}%                  ║",
-            lower, upper, count, correct, accuracy
-        );
+        println!("  [{:.1}-{:.1}]    {:>5}      {:>5}    {:>6.2}%", lower, upper, count, correct, accuracy);
     }
+    println!();
 
     // Price movement analysis
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ PRICE MOVEMENT ANALYSIS                                        ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    println!("PRICE MOVEMENT ANALYSIS");
     let avg_price_change = total_price_change_pct / total_samples as f64;
     let avg_correct_change = if confusion.true_positives + confusion.true_negatives > 0 {
         correct_price_change_pct / (confusion.true_positives + confusion.true_negatives) as f64
@@ -428,23 +383,13 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
     } else {
         0.0
     };
-    info!(
-        "║ Avg price change:          {:>8.4}%                        ║",
-        avg_price_change
-    );
-    info!(
-        "║ Avg change (correct):      {:>8.4}%                        ║",
-        avg_correct_change
-    );
-    info!(
-        "║ Avg change (incorrect):    {:>8.4}%                        ║",
-        avg_incorrect_change
-    );
+    println!("  Avg price change:        {:8.4}%", avg_price_change);
+    println!("  Avg change (correct):    {:8.4}%", avg_correct_change);
+    println!("  Avg change (incorrect):  {:8.4}%", avg_incorrect_change);
+    println!();
 
     // Hourly performance (top 5 best and worst hours)
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ HOURLY PERFORMANCE (Top 5 Best Hours)                          ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    println!("HOURLY PERFORMANCE (Top 5 Best Hours)");
     let mut hourly_vec: Vec<_> = hourly_stats.values().collect();
     hourly_vec.sort_by(|a, b| {
         let acc_a = if a.total > 0 { a.correct as f64 / a.total as f64 } else { 0.0 };
@@ -458,32 +403,30 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
         } else {
             0.0
         };
-        info!(
-            "║ Hour {:02}:00 - {:>4} samples, {:>6.2}% accuracy, UP:{:>4} DOWN:{:>4}  ║",
+        println!(
+            "  Hour {:02}:00 - {:>4} samples, {:>6.2}% accuracy, UP:{:>4} DOWN:{:>4}",
             hourly.hour, hourly.total, accuracy, hourly.up_predictions, hourly.down_predictions
         );
     }
+    println!();
 
     // Worst hours
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ HOURLY PERFORMANCE (Top 5 Worst Hours)                         ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    println!("HOURLY PERFORMANCE (Top 5 Worst Hours)");
     for hourly in hourly_vec.iter().rev().take(5) {
         let accuracy = if hourly.total > 0 {
             hourly.correct as f64 / hourly.total as f64 * 100.0
         } else {
             0.0
         };
-        info!(
-            "║ Hour {:02}:00 - {:>4} samples, {:>6.2}% accuracy, UP:{:>4} DOWN:{:>4}  ║",
+        println!(
+            "  Hour {:02}:00 - {:>4} samples, {:>6.2}% accuracy, UP:{:>4} DOWN:{:>4}",
             hourly.hour, hourly.total, accuracy, hourly.up_predictions, hourly.down_predictions
         );
     }
+    println!();
 
     // Daily performance summary
-    info!("╠════════════════════════════════════════════════════════════════╣");
-    info!("║ DAILY PERFORMANCE SUMMARY                                      ║");
-    info!("╠════════════════════════════════════════════════════════════════╣");
+    println!("DAILY PERFORMANCE SUMMARY");
     let mut daily_vec: Vec<_> = daily_stats.values().collect();
     daily_vec.sort_by(|a, b| a.date.cmp(&b.date));
     
@@ -518,38 +461,25 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
     }
 
     if let Some((day, acc)) = best_day {
-        info!(
-            "║ Best day:   {} - {:>4} samples, {:>6.2}% accuracy      ║",
-            day.date, day.total, acc
-        );
+        println!("  Best day:   {} - {:>4} samples, {:>6.2}% accuracy", day.date, day.total, acc);
     }
     if let Some((day, acc)) = worst_day {
-        info!(
-            "║ Worst day:  {} - {:>4} samples, {:>6.2}% accuracy      ║",
-            day.date, day.total, acc
-        );
+        println!("  Worst day:  {} - {:>4} samples, {:>6.2}% accuracy", day.date, day.total, acc);
     }
     let avg_daily_accuracy = if total_days > 0 {
         summed_daily_accuracy / total_days as f64
     } else {
         0.0
     };
-    info!(
-        "║ Avg daily accuracy: {:>8.2}% over {:>3} days               ║",
-        avg_daily_accuracy, total_days
-    );
-
-    info!("╚════════════════════════════════════════════════════════════════╝");
+    println!("  Avg daily accuracy: {:>8.2}% over {:>3} days", avg_daily_accuracy, total_days);
+    println!();
 
     // Display last 100 records with predictions
     let display_count = predictions.len().min(100);
     let start_idx = predictions.len().saturating_sub(100);
     
-    info!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    info!("║                           LAST {} RECORDS WITH PREDICTIONS                                           ║", display_count);
-    info!("╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣");
-    info!("║  #  │       Time Range       │  Start Price  │   End Price   │  Pred  │ Actual │ Result  │ Prob    ║");
-    info!("╠═════╪════════════════════════╪═══════════════╪═══════════════╪════════╪════════╪═════════╪═════════╣");
+    println!("=== LAST {} RECORDS WITH PREDICTIONS ===", display_count);
+    println!("  #   |       Time Range       |  Start Price  |   End Price   | Pred  | Actual | Result    | Prob");
     
     for idx in start_idx..predictions.len() {
         let (pred_prob, target) = &predictions[idx];
@@ -566,10 +496,10 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
         
         let pred_dir = if *pred_prob > 0.5 { "UP  " } else { "DOWN" };
         let actual_dir = if is_up { "UP  " } else { "DOWN" };
-        let result = if correct { "✓ CORRECT" } else { "✗ WRONG  " };
+        let result = if correct { "CORRECT" } else { "WRONG" };
         
-        info!(
-            "║ {:^3} │ {:^22} │ {:>13.2} │ {:>13.2} │ {:>6} │ {:>6} │ {} │ {:>6.2}%  ║",
+        println!(
+            " {:>3}  | {:^22} | {:>13.2} | {:>13.2} | {:>4}  | {:>6} | {:>8} | {:>6.2}%",
             idx + 1,
             time_range,
             sample.start_price,
@@ -580,25 +510,23 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
             pred_prob * 100.0
         );
     }
-    info!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝");
 
     // Summary recommendation
-    info!("VALIDATION COMPLETE");
-    info!(
-        accuracy = format!("{:.2}%", confusion.accuracy() * 100.0),
-        precision = format!("{:.4}", confusion.precision()),
-        recall = format!("{:.4}", confusion.recall()),
-        f1 = format!("{:.4}", confusion.f1_score()),
-        samples = total_samples,
-        "Final metrics"
-    );
+    println!();
+    println!("=== SUMMARY ===");
+    println!("  Accuracy:  {:.2}%", confusion.accuracy() * 100.0);
+    println!("  Precision: {:.4}", confusion.precision());
+    println!("  Recall:    {:.4}", confusion.recall());
+    println!("  F1 Score:  {:.4}", confusion.f1_score());
+    println!("  Samples:   {}", total_samples);
+    println!();
 
     if confusion.accuracy() > 0.55 {
-        info!("✓ Model shows predictive capability above random baseline (50%)");
+        println!("Model shows predictive capability above random baseline (50%)");
     } else if confusion.accuracy() > 0.50 {
-        info!("⚠ Model shows minimal predictive capability, consider more training data");
+        println!("Model shows minimal predictive capability, consider more training data");
     } else {
-        info!("✗ Model below random baseline, investigate data quality or model architecture");
+        println!("Model below random baseline, investigate data quality or model architecture");
     }
 
     Ok(())
