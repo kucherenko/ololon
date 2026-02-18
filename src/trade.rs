@@ -110,10 +110,13 @@ pub struct PolymarketClient {
 
 impl PolymarketClient {
     pub fn new(
-        gamma_api_url: String, clob_api_url: String,
-        private_key: Option<String>, api_key: Option<String>, api_secret: Option<String>,
+        gamma_api_url: &str,
+        clob_api_url: &str,
+        private_key: Option<&str>,
+        api_key: Option<&str>,
+        api_secret: Option<&str>,
     ) -> Result<Self> {
-        let (signing_key, address) = if let Some(pk) = &private_key {
+        let (signing_key, address) = if let Some(pk) = private_key {
             let pk_hex = pk.strip_prefix("0x").unwrap_or(pk);
             let pk_bytes = hex::decode(pk_hex).context("Failed to decode private key")?;
             let sk = SigningKey::from_bytes((&pk_bytes[..]).into()).context("Failed to create signing key")?;
@@ -123,7 +126,12 @@ impl PolymarketClient {
 
         Ok(Self {
             http: Client::builder().timeout(Duration::from_secs(10)).build()?,
-            gamma_api_url, clob_api_url, signing_key, address, api_key, api_secret,
+            gamma_api_url: gamma_api_url.to_string(),
+            clob_api_url: clob_api_url.to_string(),
+            signing_key,
+            address,
+            api_key: api_key.map(|s| s.to_string()),
+            api_secret: api_secret.map(|s| s.to_string()),
         })
     }
 
@@ -192,7 +200,8 @@ impl InferenceWindow {
 
     fn compute_normalized_log_returns(&self) -> Option<Vec<f32>> {
         if self.prices.len() < 2 { return None; }
-        let returns: Vec<f64> = self.prices.iter().zip(self.prices.iter().skip(1)).map(|(p, c)| (c / p).ln()).collect();
+        let prices: Vec<f64> = self.prices.iter().copied().collect();
+        let returns: Vec<f64> = prices.windows(2).map(|w| (w[1] / w[0]).ln()).collect();
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
         let std = (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64).sqrt();
         if std < 1e-10 { Some(returns.iter().map(|_| 0.0f32).collect()) }
@@ -256,8 +265,13 @@ pub async fn run(config: TradeConfig) -> Result<()> {
     let recorder = JsonGzFileRecorder::<FullPrecisionSettings>::new();
     let model = model.load_file(&config.model_path, &recorder, &device).context("Failed to load model")?;
 
-    let poly = PolymarketClient::new(config.gamma_api_url.clone(), config.clob_api_url.clone(),
-        config.private_key.clone(), config.api_key.clone(), config.api_secret.clone())?;
+    let poly = PolymarketClient::new(
+        &config.gamma_api_url,
+        &config.clob_api_url,
+        config.private_key.as_deref(),
+        config.api_key.as_deref(),
+        config.api_secret.as_deref(),
+    )?;
 
     let window = Arc::new(RwLock::new(InferenceWindow::new(window_size + 1)));
     let last_trade = Arc::new(RwLock::new(0i64));

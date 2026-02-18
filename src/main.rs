@@ -17,11 +17,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(version)]
 struct Cli {
     /// Path to SQLite database file
-    #[arg(short, long, global = true, default_value = "ololon.db")]
+    #[arg(short, long, global = true, env = "OLOLON_DATABASE", default_value = "ololon.db")]
     database: String,
 
     /// Path to model weights file (for train/trade commands)
-    #[arg(short, long, global = true, default_value = "model.json.gz")]
+    #[arg(short, long, global = true, env = "OLOLON_MODEL", default_value = "model.json.gz")]
     model: String,
 
     #[command(subcommand)]
@@ -33,74 +33,82 @@ enum Commands {
     /// Collect real-time price data from Binance and create labeled training samples
     Collect {
         /// Binance WebSocket URL
-        #[arg(long, default_value = "wss://stream.binance.com:9443/ws")]
+        #[arg(long, env = "OLOLON_WS_URL", default_value = "wss://stream.binance.com:9443/ws")]
         ws_url: String,
 
         /// Trading pair symbol
-        #[arg(long, default_value = "btcusdt")]
+        #[arg(long, env = "OLOLON_SYMBOL", default_value = "btcusdt")]
         symbol: String,
 
         /// Window size for feature computation (number of price points)
-        #[arg(long, default_value = "60")]
+        #[arg(long, env = "OLOLON_WINDOW_SIZE", default_value = "60")]
         window_size: usize,
 
         /// Labeling delay in seconds (default: 300 = 5 minutes)
-        #[arg(long, default_value = "300")]
+        #[arg(long, env = "OLOLON_LABEL_DELAY_SECS", default_value = "300")]
         label_delay_secs: u64,
     },
 
     /// Train the LSTM model on collected labeled data
     Train {
         /// Number of training epochs
-        #[arg(long, default_value = "100")]
+        #[arg(long, env = "OLOLON_EPOCHS", default_value = "100")]
         epochs: usize,
 
         /// Batch size for training
-        #[arg(long, default_value = "32")]
+        #[arg(long, env = "OLOLON_BATCH_SIZE", default_value = "32")]
         batch_size: usize,
 
         /// Learning rate
-        #[arg(long, default_value = "0.001")]
+        #[arg(long, env = "OLOLON_LEARNING_RATE", default_value = "0.001")]
         learning_rate: f64,
 
         /// Hidden size for LSTM layer
-        #[arg(long, default_value = "64")]
+        #[arg(long, env = "OLOLON_HIDDEN_SIZE", default_value = "64")]
         hidden_size: usize,
 
         /// Number of LSTM layers
-        #[arg(long, default_value = "2")]
+        #[arg(long, env = "OLOLON_NUM_LAYERS", default_value = "2")]
         num_layers: usize,
 
         /// Validation split ratio (0.0 - 1.0)
-        #[arg(long, default_value = "0.2")]
+        #[arg(long, env = "OLOLON_VALIDATION_SPLIT", default_value = "0.2")]
         validation_split: f64,
     },
 
     /// Run live trading with model inference and Polymarket execution
     Trade {
         /// Binance WebSocket URL
-        #[arg(long, default_value = "wss://stream.binance.com:9443/ws")]
+        #[arg(long, env = "OLOLON_WS_URL", default_value = "wss://stream.binance.com:9443/ws")]
         ws_url: String,
 
         /// Trading pair symbol
-        #[arg(long, default_value = "btcusdt")]
+        #[arg(long, env = "OLOLON_SYMBOL", default_value = "btcusdt")]
         symbol: String,
 
         /// Polymarket Gamma API base URL
-        #[arg(long, default_value = "https://gamma-api.polymarket.com")]
+        #[arg(long, env = "OLOLON_GAMMA_API_URL", default_value = "https://gamma-api.polymarket.com")]
         gamma_api_url: String,
 
         /// Polymarket CLOB API base URL
-        #[arg(long, default_value = "https://clob.polymarket.com")]
+        #[arg(long, env = "OLOLON_CLOB_API_URL", default_value = "https://clob.polymarket.com")]
         clob_api_url: String,
 
         /// Minimum probability edge required to place a trade
-        #[arg(long, default_value = "0.05")]
+        #[arg(long, env = "OLOLON_MIN_EDGE", default_value = "0.05")]
         min_edge: f64,
 
         /// Trade size in USDC
-        #[arg(long, default_value = "10.0")]
+        #[arg(long, env = "OLOLON_TRADE_SIZE", default_value = "10.0")]
         trade_size: f64,
+
+        /// Hidden size for LSTM inference (must match trained model)
+        #[arg(long, env = "OLOLON_HIDDEN_SIZE", default_value = "64")]
+        hidden_size: usize,
+
+        /// Number of LSTM layers for inference (must match trained model)
+        #[arg(long, env = "OLOLON_NUM_LAYERS", default_value = "2")]
+        num_layers: usize,
 
         /// Ethereum private key for L1 signing (or set POLY_PRIVATE_KEY env var)
         #[arg(long, env = "POLY_PRIVATE_KEY")]
@@ -174,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
             clob_api_url,
             min_edge,
             trade_size,
+            hidden_size,
+            num_layers,
             private_key,
             api_key,
             api_secret,
@@ -187,8 +197,8 @@ async fn main() -> anyhow::Result<()> {
                 clob_api_url,
                 min_edge,
                 trade_size,
-                hidden_size: 64,      // Default hidden size for inference
-                num_layers: 2,         // Default num layers for inference
+                hidden_size,
+                num_layers,
                 private_key,
                 api_key,
                 api_secret,

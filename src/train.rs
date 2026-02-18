@@ -262,7 +262,8 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             let pred = model.forward(batch.features);
             let loss = binary_cross_entropy(pred, batch.targets);
 
-            train_loss += loss.to_data().as_slice::<f32>().map(|s| s[0]).unwrap_or(0.0);
+            let loss_val = loss.to_data().as_slice::<f32>().and_then(|s| s.first()).copied().unwrap_or(0.0);
+            train_loss += loss_val;
             train_batches += 1;
 
             let grads = loss.backward();
@@ -289,15 +290,16 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             let pred = model_val.forward(batch.features);
             let loss = binary_cross_entropy(pred.clone(), batch.targets.clone());
             
-            val_loss += loss.to_data().as_slice::<f32>().map(|s| s[0]).unwrap_or(0.0);
+            let loss_val = loss.to_data().as_slice::<f32>().and_then(|s| s.first()).copied().unwrap_or(0.0);
+            val_loss += loss_val;
             val_batches += 1;
 
             let pred_data = pred.to_data();
             let target_data = batch.targets.to_data();
-            let preds = pred_data.as_slice::<f32>().unwrap_or(&[]);
-            let targets = target_data.as_slice::<f32>().unwrap_or(&[]);
-            
-            for (p, t) in preds.iter().zip(targets.iter()) {
+            let preds = pred_data.as_slice::<f32>().unwrap_or_default();
+            let targets = target_data.as_slice::<f32>().unwrap_or_default();
+
+            for (&p, &t) in preds.iter().zip(targets.iter()) {
                 let is_up = *t > 0.5;
                 let pred_up = *p > 0.5;
                 let correct_pred = pred_up == is_up;
