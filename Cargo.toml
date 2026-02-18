@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "BTC/USDT 5-minute prediction trading bot with deep learning"
 authors = ["ololon"]
-license = "MyIT"
+license = "Proprietary - All rights reserved"
 
 [dependencies]
 # Async runtime
