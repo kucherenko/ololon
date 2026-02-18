@@ -241,8 +241,8 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     let model_config = PricePredictorConfig::new(input_size, config.hidden_size);
     let model = model_config.init::<MyAutodiff>(&device);
 
-    let train_batcher = PriceBatcher::<MyAutodiff>::new(device.clone(), input_size);
-    let val_batcher = PriceBatcher::<MyBackend>::new(device.clone(), input_size);
+    let train_batcher = PriceBatcher::<MyAutodiff>::new(device, input_size);
+    let val_batcher = PriceBatcher::<MyBackend>::new(device, input_size);
 
     let mut optimizer = AdamConfig::new().init();
     let mut model = model;
@@ -262,7 +262,10 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             let pred = model.forward(batch.features);
             let loss = binary_cross_entropy(pred, batch.targets);
 
-            let loss_val = loss.to_data().as_slice::<f32>().and_then(|s| s.first()).copied().unwrap_or(0.0);
+            let loss_val = loss.to_data()
+                .as_slice::<f32>()
+                .map(|s| s.first().copied().unwrap_or(0.0))
+                .unwrap_or(0.0);
             train_loss += loss_val;
             train_batches += 1;
 
@@ -290,7 +293,10 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             let pred = model_val.forward(batch.features);
             let loss = binary_cross_entropy(pred.clone(), batch.targets.clone());
             
-            let loss_val = loss.to_data().as_slice::<f32>().and_then(|s| s.first()).copied().unwrap_or(0.0);
+            let loss_val = loss.to_data()
+                .as_slice::<f32>()
+                .map(|s| s.first().copied().unwrap_or(0.0))
+                .unwrap_or(0.0);
             val_loss += loss_val;
             val_batches += 1;
 
@@ -299,7 +305,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             let preds = pred_data.as_slice::<f32>().unwrap_or_default();
             let targets = target_data.as_slice::<f32>().unwrap_or_default();
 
-            for (&p, &t) in preds.iter().zip(targets.iter()) {
+            for (p, t) in preds.iter().zip(targets.iter()) {
                 let is_up = *t > 0.5;
                 let pred_up = *p > 0.5;
                 let correct_pred = pred_up == is_up;

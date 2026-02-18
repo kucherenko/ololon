@@ -163,8 +163,8 @@ fn get_current_window(timestamp_secs: i64, window_duration_secs: i64) -> (i64, i
 
 /// Format timestamp as human-readable time range
 fn format_time_range(start: i64, end: i64) -> String {
-    let start_dt = Utc.timestamp_opt(start, 0).single().unwrap_or_else(|| Utc::now());
-    let end_dt = Utc.timestamp_opt(end, 0).single().unwrap_or_else(|| Utc::now());
+    let start_dt = Utc.timestamp_opt(start, 0).single().unwrap_or_else(Utc::now);
+    let end_dt = Utc.timestamp_opt(end, 0).single().unwrap_or_else(Utc::now);
     format!("{} - {}", start_dt.format("%H:%M:%S"), end_dt.format("%H:%M:%S"))
 }
 

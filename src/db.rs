@@ -275,7 +275,22 @@ pub fn insert_trade(conn: &Connection, trade: &TradeRecord) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// Model training metadata for database operations
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ModelMetadata {
+    pub model_path: String,
+    pub trained_at: i64,
+    pub epochs: usize,
+    pub final_train_loss: f64,
+    pub final_val_loss: Option<f64>,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub window_duration_secs: i64,
+}
+
 /// Save model metadata after training
+#[allow(clippy::too_many_arguments)]
 pub fn save_model_metadata(
     conn: &Connection,
     model_path: &str,

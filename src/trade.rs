@@ -286,7 +286,9 @@ pub async fn run(config: TradeConfig) -> Result<()> {
             msg = read.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     if let Ok(trade) = serde_json::from_str::<BinanceTrade>(&t) {
-                        if let Ok(p) = trade.price.parse() { window.write().await.push(p); }
+                        if let Ok(price) = trade.price.parse() {
+                            window.write().await.push(price);
+                        }
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
@@ -300,10 +302,13 @@ pub async fn run(config: TradeConfig) -> Result<()> {
                 let Some(feat) = features else { continue; };
 
                 let input_len = feat.len();
-                let batcher = PriceBatcher::<MyBackend>::new(device.clone(), input_len);
+                let batcher = PriceBatcher::<MyBackend>::new(device, input_len);
                 let batch = batcher.batch(feat, input_len);
                 let pred = model.forward(batch.features);
-                let prob = pred.to_data().as_slice::<f32>().map(|s| s[0]).unwrap_or(0.5);
+                let prob = pred.to_data()
+                    .as_slice::<f32>()
+                    .map(|s| s.first().copied().unwrap_or(0.5))
+                    .unwrap_or(0.5);
 
                 info!(prob_up = format!("{:.4}", prob), "Prediction");
 
@@ -321,9 +326,9 @@ async fn trade_logic(cfg: &TradeConfig, poly: &PolymarketClient, prob: f32, last
     if *last.read().await > now - 60 { return Ok(()); }
 
     let mkt = match poly.find_btc_updown_market().await? { Some(m) => m, None => { warn!("No market"); return Ok(()); } };
-    let yes: f64 = mkt.outcome_prices.get(0).and_then(|p| p.parse().ok()).unwrap_or(0.5);
+    let yes: f64 = mkt.outcome_prices.first().and_then(|p| p.parse().ok()).unwrap_or(0.5);
     let no: f64 = mkt.outcome_prices.get(1).and_then(|p| p.parse().ok()).unwrap_or(0.5);
-    let tid = mkt.tokens.get(0).map(|t| t.token_id.as_str()).unwrap_or(&mkt.condition_id);
+    let tid = mkt.tokens.first().map(|t| t.token_id.as_str()).unwrap_or(&mkt.condition_id);
 
     let (out, edge, price, tok) = if prob as f64 - yes > cfg.min_edge {
         ("YES", prob as f64 - yes, yes, tid.to_string())
