@@ -14,17 +14,20 @@ use std::path::Path;
 
 /// Initialize the database connection and create schema
 pub async fn init_db(db_path: &str) -> Result<SqliteConnection> {
-    // Ensure parent directory exists (sqlx doesn't auto-create like rusqlite)
-    let path = Path::new(db_path);
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
+    // For in-memory databases, skip file/directory creation
+    if db_path != ":memory:" {
+        // Ensure parent directory exists (sqlx doesn't auto-create like rusqlite)
+        let path = Path::new(db_path);
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-    }
-    
-    // Create empty file if it doesn't exist (required for sqlx)
-    if !path.exists() {
-        std::fs::File::create(db_path)?;
+
+        // Create empty file if it doesn't exist (required for sqlx)
+        if !path.exists() {
+            std::fs::File::create(db_path)?;
+        }
     }
 
     let mut conn = SqliteConnection::connect(db_path).await?;
