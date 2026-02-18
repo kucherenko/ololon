@@ -257,8 +257,9 @@ pub async fn run(config: TradeConfig) -> Result<()> {
     }
 
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let conn = db::init_db(&config.db_path)?;
-    let window_size: usize = conn.query_row("SELECT window_size FROM model_metadata WHERE id = 1", [], |r| r.get(0)).unwrap_or(59);
+    let mut conn = db::init_db(&config.db_path).await?;
+    let metadata = db::get_model_metadata(&mut conn).await?;
+    let window_size: usize = metadata.map(|m| m.1 as usize).unwrap_or(59);
 
     let model_config = PricePredictorConfig::new(window_size, config.hidden_size, 1);
     let model = model_config.init::<MyBackend>(&device);

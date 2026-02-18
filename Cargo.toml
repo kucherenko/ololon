@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+ormlite = { version = "0.23", features = ["sqlite"] }
 
 # Deep Learning - Burn framework
 burn = { version = "0.16", features = ["ndarray", "train"] }

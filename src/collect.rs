@@ -9,6 +9,8 @@
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
+use ormlite::sqlite::SqliteConnection;
+use ormlite::Connection;
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -179,6 +181,7 @@ enum DbCommand {
         num_points: usize,
         direction: i32,
     },
+    Shutdown,
 }
 
 /// Main entry point for the collect subcommand
@@ -197,17 +200,14 @@ pub async fn run(config: Config) -> Result<()> {
     // Initialize database
     let db_path = PathBuf::from(&config.db_path);
 
-    // Check existing data
-    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM features", [], |row| row.get(0)
-        ).unwrap_or(0);
+    // Check existing data (async)
+    {
+        let mut conn = db::init_db(&db_path.to_string_lossy()).await?;
+        let count = db::count_total_features(&mut conn).await.unwrap_or(0);
         if count > 0 {
             info!(existing_windows = count, "Found existing data in database");
         }
     }
-
-    db::init_db(&db_path.to_string_lossy())?;
     info!("Database initialized");
 
     // Shared state
@@ -222,9 +222,18 @@ pub async fn run(config: Config) -> Result<()> {
     // Channel for database operations
     let (db_tx, mut db_rx) = mpsc::unbounded_channel::<DbCommand>();
 
-    // Database writer task
+    // Database writer task (async with ormlite)
     let total_stored_clone = Arc::clone(&total_windows_stored);
     let db_writer = tokio::spawn(async move {
+        // Open connection once for the writer task
+        let mut conn = match SqliteConnection::connect(&db_path_for_writer.to_string_lossy()).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = ?e, "Failed to open database connection for writer");
+                return;
+            }
+        };
+
         while let Some(cmd) = db_rx.recv().await {
             match cmd {
                 DbCommand::InsertWindow {
@@ -236,70 +245,71 @@ pub async fn run(config: Config) -> Result<()> {
                     num_points,
                     direction,
                 } => {
-                    match rusqlite::Connection::open(&db_path_for_writer) {
-                        Ok(conn) => {
-                            // Check if this window already exists
-                            let exists: bool = conn.query_row(
-                                "SELECT COUNT(*) > 0 FROM features WHERE time_range_start = ?1",
-                                rusqlite::params![time_range_start],
-                                |row| row.get(0),
-                            ).unwrap_or(false);
+                    // Check if this window already exists
+                    let exists_result: Result<Option<(i32,)>, _> = ormlite::query_as(
+                        "SELECT 1 FROM features WHERE time_range_start = ?1 LIMIT 1",
+                    )
+                    .bind(time_range_start)
+                    .fetch_optional(&mut conn)
+                    .await;
 
-                            if !exists {
-                                // Insert with direction label already set
-                                let vector_json = serde_json::to_string(&feature_vector).unwrap_or_default();
-                                let labeled_at = Utc::now().timestamp();
-                                let feature_len = feature_vector.len();
+                    let exists = matches!(exists_result, Ok(Some(_)));
 
-                                match conn.execute(
-                                    "INSERT INTO features
-                                     (time_range_start, time_range_end, start_price, end_price,
-                                      feature_vector, target, num_points, labeled_at)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                                    rusqlite::params![
-                                        time_range_start,
-                                        time_range_end,
-                                        start_price,
-                                        end_price,
-                                        vector_json,
-                                        direction,
-                                        num_points as i32,
-                                        labeled_at,
-                                    ],
-                                ) {
-                                    Ok(_) => {
-                                        let count = total_stored_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                                        let dir_str = match direction {
-                                            1 => "UP ↑",
-                                            -1 => "DOWN ↓",
-                                            _ => "FLAT →",
-                                        };
-                                        let change_pct = (end_price - start_price) / start_price * 100.0;
+                    if !exists {
+                        // Insert with direction label already set
+                        let vector_json = serde_json::to_string(&feature_vector).unwrap_or_default();
+                        let labeled_at = Utc::now().timestamp();
+                        let feature_len = feature_vector.len();
 
-                                        info!(
-                                            "✓ STORED WINDOW #{}: {} | {} -> {} | {} | {:.4}% | {} prices, {} features",
-                                            count,
-                                            format_time_range(time_range_start, time_range_end),
-                                            format!("{:.2}", start_price),
-                                            format!("{:.2}", end_price),
-                                            dir_str,
-                                            change_pct,
-                                            num_points,
-                                            feature_len
-                                        );
-                                    }
-                                    Err(e) => error!(error = ?e, "Failed to insert window"),
-                                }
-                            } else {
-                                debug!(
-                                    time_range = %format_time_range(time_range_start, time_range_end),
-                                    "Window already exists, skipping"
+                        let result = ormlite::query(
+                            "INSERT INTO features
+                             (time_range_start, time_range_end, start_price, end_price,
+                              feature_vector, target, num_points, labeled_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        )
+                        .bind(time_range_start)
+                        .bind(time_range_end)
+                        .bind(start_price)
+                        .bind(end_price)
+                        .bind(&vector_json)
+                        .bind(direction)
+                        .bind(num_points as i32)
+                        .bind(labeled_at)
+                        .execute(&mut conn)
+                        .await;
+
+                        match result {
+                            Ok(_) => {
+                                let count = total_stored_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                                let dir_str = match direction {
+                                    1 => "UP ↑",
+                                    -1 => "DOWN ↓",
+                                    _ => "FLAT →",
+                                };
+                                let change_pct = (end_price - start_price) / start_price * 100.0;
+
+                                info!(
+                                    "✓ STORED WINDOW #{}: {} | {} -> {} | {} | {:.4}% | {} prices, {} features",
+                                    count,
+                                    format_time_range(time_range_start, time_range_end),
+                                    format!("{:.2}", start_price),
+                                    format!("{:.2}", end_price),
+                                    dir_str,
+                                    change_pct,
+                                    num_points,
+                                    feature_len
                                 );
                             }
+                            Err(e) => error!(error = ?e, "Failed to insert window"),
                         }
-                        Err(e) => error!(error = ?e, "Failed to open database"),
+                    } else {
+                        debug!(
+                            time_range = %format_time_range(time_range_start, time_range_end),
+                            "Window already exists, skipping"
+                        );
                     }
                 }
+                DbCommand::Shutdown => break,
             }
         }
     });
@@ -431,15 +441,23 @@ pub async fn run(config: Config) -> Result<()> {
                         let direction = completed.compute_direction();
 
                         // Process previous window (if exists) - store it now
+                        // Use the COMPLETED window's direction as the target for the previous window
+                        // This is the key fix: features from window T predict price direction of window T+1
+                        let next_window_direction = direction; // direction of the just-completed window
                         {
                             let mut prev = previous_window.write().await;
                             if let Some(prev_completed) = prev.take() {
                                 if prev_completed.prices.len() >= min_samples {
                                     if let Some(features) = prev_completed.compute_log_returns() {
                                         info!(
-                                            "📦 STORING PREVIOUS: {} | {} features computed",
+                                            "📦 STORING PREVIOUS: {} | {} features computed | Target from next window: {}",
                                             format_time_range(prev_completed.time_range_start, prev_completed.time_range_end),
-                                            features.len()
+                                            features.len(),
+                                            match next_window_direction {
+                                                1 => "UP ↑",
+                                                -1 => "DOWN ↓",
+                                                _ => "FLAT →",
+                                            }
                                         );
                                         let _ = db_tx.send(DbCommand::InsertWindow {
                                             time_range_start: prev_completed.time_range_start,
@@ -448,7 +466,7 @@ pub async fn run(config: Config) -> Result<()> {
                                             end_price: prev_completed.end_price,
                                             feature_vector: features,
                                             num_points: prev_completed.prices.len(),
-                                            direction: prev_completed.compute_direction(),
+                                            direction: next_window_direction, // Use NEXT window's direction as target
                                         });
                                     }
                                 } else {
@@ -536,13 +554,40 @@ pub async fn run(config: Config) -> Result<()> {
         let mut window_guard = active_window.write().await;
         let mut prev_guard = previous_window.write().await;
 
-        // Store previous window if exists
+        // First finalize the current window to get its direction
+        let current_direction = if let Some(current) = window_guard.take() {
+            if current.num_points() >= min_samples {
+                let end_price = current.prices.back().map(|p| p.price).unwrap_or(current.start_price);
+                let completed = current.finalize_with_end_price(end_price);
+                let dir = completed.compute_direction();
+                // Store current window but note it has no target (no future window)
+                // We skip storing it since it can't be properly labeled for training
+                info!(
+                    "⚠️ SKIPPING CURRENT (no future window for target): {}",
+                    format_time_range(completed.time_range_start, completed.time_range_end)
+                );
+                Some(dir)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Store previous window using current window's direction as target
         if let Some(prev_completed) = prev_guard.take() {
             if prev_completed.prices.len() >= min_samples {
                 if let Some(features) = prev_completed.compute_log_returns() {
+                    // Use the current window's direction as target for previous
+                    let target_direction = current_direction.unwrap_or_else(|| prev_completed.compute_direction());
                     info!(
-                        "📦 FINALIZING PREVIOUS: {}",
-                        format_time_range(prev_completed.time_range_start, prev_completed.time_range_end)
+                        "📦 FINALIZING PREVIOUS: {} | Target from next window: {}",
+                        format_time_range(prev_completed.time_range_start, prev_completed.time_range_end),
+                        match target_direction {
+                            1 => "UP ↑",
+                            -1 => "DOWN ↓",
+                            _ => "FLAT →",
+                        }
                     );
                     let _ = db_tx.send(DbCommand::InsertWindow {
                         time_range_start: prev_completed.time_range_start,
@@ -551,30 +596,7 @@ pub async fn run(config: Config) -> Result<()> {
                         end_price: prev_completed.end_price,
                         feature_vector: features,
                         num_points: prev_completed.prices.len(),
-                        direction: prev_completed.compute_direction(),
-                    });
-                }
-            }
-        }
-
-        // Current window cannot be fully labeled (no next window), but store it with available data
-        if let Some(current) = window_guard.take() {
-            if current.num_points() >= min_samples {
-                let end_price = current.prices.back().map(|p| p.price).unwrap_or(current.start_price);
-                let completed = current.finalize_with_end_price(end_price);
-                if let Some(features) = completed.compute_log_returns() {
-                    info!(
-                        "📦 FINALIZING CURRENT (partial): {}",
-                        format_time_range(completed.time_range_start, completed.time_range_end)
-                    );
-                    let _ = db_tx.send(DbCommand::InsertWindow {
-                        time_range_start: completed.time_range_start,
-                        time_range_end: completed.time_range_end,
-                        start_price: completed.start_price,
-                        end_price: completed.end_price,
-                        feature_vector: features,
-                        num_points: completed.prices.len(),
-                        direction: completed.compute_direction(),
+                        direction: target_direction,
                     });
                 }
             }
@@ -583,6 +605,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Cleanup
     status_logger.abort();
+    let _ = db_tx.send(DbCommand::Shutdown);
     drop(db_tx);
     let _ = db_writer.await;
 

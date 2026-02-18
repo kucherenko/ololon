@@ -169,8 +169,9 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     );
 
     // Load labeled features from database
-    let conn = db::init_db(&config.db_path)?;
-    let labeled_features = db::fetch_labeled_features(&conn)
+    let mut conn = db::init_db(&config.db_path).await?;
+    let labeled_features = db::fetch_labeled_features(&mut conn)
+        .await
         .context("Failed to fetch labeled features from database")?;
 
     if labeled_features.is_empty() {
@@ -352,9 +353,8 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     model.save_file(&config.model_path, &recorder).context("Failed to save model")?;
     
     // Save model metadata to database
-    let conn = db::init_db(&config.db_path)?;
     db::save_model_metadata(
-        &conn,
+        &mut conn,
         &config.model_path,
         config.epochs,
         final_train_loss as f64,
@@ -362,7 +362,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
         config.hidden_size,
         config.num_layers,
         300, // 5-minute window duration
-    ).ok();
+    ).await.ok();
     
     info!(
         model_path = %config.model_path,
