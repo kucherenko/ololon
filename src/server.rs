@@ -7,13 +7,15 @@
 //! - GET /api/trades - List trades (optional ?limit=N&offset=M)
 //! - GET /api/trades/:id - Get single trade
 //! - GET /api/model - Get model metadata
+//! - GET /api/logs/stream - Server-Sent Events stream of bot logs
+//! - GET /api/logs - Get recent log entries (optional ?lines=N)
 //! - GET /health - Health check (no auth required)
 
 use axum::{
     extract::{rejection::QueryRejection, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, sse::Event},
     routing::get,
     Json, Router,
 };
@@ -21,6 +23,7 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
+use futures_util::StreamExt;
 use ormlite::sqlite::SqliteConnection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -37,6 +40,8 @@ pub struct Config {
     pub db_path: String,
     pub auth_token: String,
     pub bind_address: String,
+    /// Path to the log file (default: logs/ololon.log)
+    pub log_path: String,
 }
 
 /// Shared application state
@@ -44,6 +49,7 @@ pub struct Config {
 pub struct AppState {
     pub db: Arc<RwLock<SqliteConnection>>,
     pub auth_token: String,
+    pub log_path: String,
 }
 
 /// Query parameters for feature listing
@@ -102,12 +108,15 @@ pub struct HealthResponse {
         list_trades,
         get_trade,
         get_model_metadata,
+        get_logs,
+        stream_logs,
     ),
     components(
         schemas(
             ApiError,
             FeatureStats,
             HealthResponse,
+            LogEntry,
             db::Feature,
             db::Trade,
             db::ModelMetadata,
@@ -139,6 +148,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState {
         db: Arc::new(RwLock::new(db)),
         auth_token: config.auth_token,
+        log_path: config.log_path,
     };
 
     // Build API routes with auth
@@ -149,7 +159,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/trades", get(list_trades))
         .route("/trades/{id}", get(get_trade))
         .route("/model", get(get_model_metadata))
+        .route("/logs", get(get_logs))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // SSE stream with its own token validation (EventSource doesn't support headers)
+    let logs_stream_route = Router::new()
+        .route("/api/logs/stream", get(stream_logs))
+        .with_state(state.clone());
 
     // Health check (no auth)
     let health_route = Router::new().route("/health", get(health_check));
@@ -161,6 +177,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api", get(|| async { "Ololon API" }))
         .nest("/api", api_routes)
+        .merge(logs_stream_route)
         .merge(health_route)
         .merge(swagger)
         .layer(
@@ -508,4 +525,342 @@ async fn get_model_metadata(
             error: "Model metadata not found".to_string(),
         }),
     }
+}
+
+/// Query parameters for log listing
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct LogQuery {
+    /// Number of lines to return from end of file (default: 100, max: 1000)
+    pub lines: Option<usize>,
+    /// Filter by command name (collect, train, trade, server, validate)
+    pub command: Option<String>,
+}
+
+/// Log entry parsed from JSON log file
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct LogEntry {
+    /// Raw JSON log line
+    pub raw: String,
+    /// Command that generated this log (extracted from span)
+    pub command: Option<String>,
+}
+
+/// Get recent log entries
+///
+/// Returns recent log lines from the bot log file. Requires Bearer token authentication.
+#[utoipa::path(
+    get,
+    path = "/api/logs",
+    params(
+        LogQuery
+    ),
+    responses(
+        (status = 200, description = "Recent log entries", body = Vec<LogEntry>),
+        (status = 401, description = "Unauthorized", body = ApiError),
+        (status = 500, description = "Failed to read logs", body = ApiError)
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn get_logs(
+    State(state): State<AppState>,
+    query: Result<Query<LogQuery>, QueryRejection>,
+) -> Result<Json<Vec<LogEntry>>, ApiError> {
+    let Query(params) = query.unwrap_or(Query(LogQuery { lines: None, command: None }));
+    let lines = params.lines.unwrap_or(100).min(1000);
+    let command_filter = params.command.as_ref().map(|c| c.to_lowercase());
+
+    // Find the most recent log file (handles daily rotation)
+    let log_path = std::path::Path::new(&state.log_path);
+    let log_file = if log_path.exists() {
+        log_path.to_path_buf()
+    } else {
+        // Try to find any log file in the logs directory
+        let logs_dir = log_path.parent().unwrap_or(std::path::Path::new("logs"));
+        let mut log_files: Vec<_> = std::fs::read_dir(logs_dir)
+            .map_err(|e| ApiError {
+                error: format!("Failed to read logs directory: {}", e),
+            })?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("ololon.log")
+            })
+            .collect();
+        
+        log_files.sort_by_key(|e| e.file_name());
+        log_files
+            .pop()
+            .map(|e| e.path())
+            .ok_or_else(|| ApiError {
+                error: "No log files found".to_string(),
+            })?
+    };
+
+    // Read and return last N lines
+    let content = std::fs::read_to_string(&log_file).map_err(|e| ApiError {
+        error: format!("Failed to read log file: {}", e),
+    })?;
+
+    let all_lines: Vec<&str> = content.lines().collect();
+    
+    // Helper to extract command from JSON log (can be in command_name or span.command_name)
+    let extract_command = |line: &str| -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(line).ok().and_then(|v| {
+            // Check command_name directly first
+            if let Some(c) = v.get("command_name").and_then(|c| c.as_str()) {
+                return Some(c.to_string());
+            }
+            // Check span.command_name
+            v.get("span")
+                .and_then(|s| s.get("command_name"))
+                .and_then(|c| c.as_str())
+                .map(|c| c.to_string())
+        })
+    };
+
+    // Filter and collect entries
+    let entries: Vec<LogEntry> = all_lines
+        .iter()
+        .rev() // Start from end
+        .filter_map(|line| {
+            let command = extract_command(line);
+            
+            // Apply command filter if specified
+            if let Some(ref filter) = command_filter {
+                if command.as_ref().map(|c| c.to_lowercase()) != Some(filter.to_lowercase()) {
+                    return None;
+                }
+            }
+            
+            Some(LogEntry {
+                raw: line.to_string(),
+                command,
+            })
+        })
+        .take(lines)
+        .collect();
+
+    // Reverse back to chronological order
+    Ok(Json(entries.into_iter().rev().collect()))
+}
+
+/// Query parameters for SSE stream (token for auth since EventSource doesn't support headers)
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct StreamQuery {
+    /// Authentication token (alternative to Bearer header for SSE)
+    pub token: Option<String>,
+    /// Filter by command name (collect, train, trade, server, validate)
+    pub command: Option<String>,
+}
+
+/// Stream log entries via Server-Sent Events
+///
+/// Streams new log entries as they are written to the log file. Requires authentication.
+/// Accepts token via query param since EventSource doesn't support custom headers.
+#[utoipa::path(
+    get,
+    path = "/api/logs/stream",
+    params(
+        StreamQuery
+    ),
+    responses(
+        (status = 200, description = "SSE stream of log entries", content_type = "text/event-stream"),
+        (status = 401, description = "Unauthorized", body = ApiError)
+    )
+)]
+async fn stream_logs(
+    State(state): State<AppState>,
+    Query(params): Query<StreamQuery>,
+) -> Result<Response, ApiError> {
+    // Validate token from query param (EventSource doesn't support headers)
+    let token = params.token.unwrap_or_default();
+    if token != state.auth_token {
+        return Err(ApiError {
+            error: "Invalid or missing authentication token".to_string(),
+        });
+    }
+    
+    let log_path = state.log_path.clone();
+    let command_filter = params.command.map(|c| c.to_lowercase());
+    
+    // Create a stream that tails the log file
+    let stream = async_stream::stream! {
+        // Use tokio::fs for async file operations
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::fs::File;
+        
+        // Helper to extract command from JSON log (can be in command_name or span.command_name)
+        fn extract_command(line: &str) -> Option<String> {
+            serde_json::from_str::<serde_json::Value>(line).ok().and_then(|v| {
+                // Check command_name directly first
+                if let Some(c) = v.get("command_name").and_then(|c| c.as_str()) {
+                    return Some(c.to_string());
+                }
+                // Check span.command_name
+                v.get("span")
+                    .and_then(|s| s.get("command_name"))
+                    .and_then(|c| c.as_str())
+                    .map(|c| c.to_string())
+            })
+        }
+        
+        // Find the log file (handle rotation)
+        let log_file = if std::path::Path::new(&log_path).exists() {
+            log_path.clone()
+        } else {
+            let logs_dir = std::path::Path::new(&log_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("logs"));
+            
+            let mut log_files: Vec<_> = match std::fs::read_dir(logs_dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name().to_string_lossy().starts_with("ololon.log")
+                    })
+                    .collect(),
+                Err(_) => {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "No log files found",
+                    ));
+                    return;
+                }
+            };
+            
+            log_files.sort_by_key(|e| e.file_name());
+            match log_files.pop() {
+                Some(e) => e.path().to_string_lossy().to_string(),
+                None => {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "No log files found",
+                    ));
+                    return;
+                }
+            }
+        };
+
+        // Initial read of existing content (last 50 lines, filtered)
+        let mut file = match File::open(&log_file).await {
+            Ok(f) => f,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
+        
+        // Get initial file position (start from end for recent logs)
+        let initial_metadata = match file.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
+        let file_size = initial_metadata.len();
+        
+        // Read all lines first to get recent ones (filtered)
+        let reader = BufReader::new(&mut file);
+        let mut lines = reader.lines();
+        let mut recent_lines: Vec<String> = Vec::new();
+        let max_recent = 50;
+        
+        while let Ok(Some(line)) = lines.next_line().await {
+            // Apply command filter
+            let command = extract_command(&line);
+            let matches = match &command_filter {
+                Some(filter) => command.as_ref().map(|c| c.to_lowercase()) == Some(filter.clone()),
+                None => true,
+            };
+            
+            if matches {
+                recent_lines.push(line);
+                if recent_lines.len() > max_recent {
+                    recent_lines.remove(0);
+                }
+            }
+        }
+        
+        // Send recent lines first
+        for line in recent_lines {
+            yield Ok(Event::default().data(line));
+        }
+
+        // Track the current position in the file
+        let mut last_pos = file_size;
+
+        // Now tail for new lines using position tracking
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Check file size
+            let current_metadata = match std::fs::metadata(&log_file) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let current_size = current_metadata.len();
+
+            // File was rotated (size reset or file changed) - send reconnect notice
+            if current_size < last_pos {
+                yield Ok(Event::default().data("--- Log file rotated ---".to_string()));
+                last_pos = 0;
+            }
+
+            // Read new content from last position
+            if current_size > last_pos {
+                // Seek to last position and read new content
+                match tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&log_file)
+                    .await
+                {
+                    Ok(mut new_file) => {
+                        use tokio::io::AsyncSeekExt;
+                        if new_file.seek(std::io::SeekFrom::Start(last_pos)).await.is_err() {
+                            continue;
+                        }
+                        
+                        let reader = BufReader::new(new_file);
+                        let mut lines = reader.lines();
+                        
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            // Apply command filter
+                            let command = extract_command(&line);
+                            let matches = match &command_filter {
+                                Some(filter) => command.as_ref().map(|c| c.to_lowercase()) == Some(filter.clone()),
+                                None => true,
+                            };
+                            
+                            if matches {
+                                yield Ok(Event::default().data(line));
+                            }
+                        }
+                        
+                        last_pos = current_size;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    };
+
+    // Convert errors to events
+    let stream = stream.map(|result: Result<Event, std::io::Error>| match result {
+        Ok(event) => Ok::<_, std::convert::Infallible>(event),
+        Err(e) => Ok(Event::default().data(format!("Error: {}", e))),
+    });
+
+    Ok(
+        axum::response::sse::Sse::new(stream)
+            .keep_alive(
+                axum::response::sse::KeepAlive::new()
+                    .interval(std::time::Duration::from_secs(15))
+                    .text("ping"),
+            )
+            .into_response(),
+    )
 }

@@ -11,7 +11,65 @@ mod trade;
 mod validate;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::{Level, Metadata};
+use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+
+/// Filter that only allows logs marked for web visibility or WARN/ERROR level
+/// 
+/// Logs are marked for web by including `web = true` field:
+/// ```ignore
+/// info!(web = true, "This appears in web interface");
+/// info!("This only appears in console");
+/// ```
+struct WebVisibleFilter;
+
+/// Helper to check if an event has web=true field
+struct WebFieldChecker {
+    has_web_field: bool,
+}
+
+impl tracing::field::Visit for WebFieldChecker {
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == "web" && value {
+            self.has_web_field = true;
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    fn record_u64(&mut self, _field: &tracing::field::Field, _value: u64) {}
+    fn record_i64(&mut self, _field: &tracing::field::Field, _value: i64) {}
+    fn record_f64(&mut self, _field: &tracing::field::Field, _value: f64) {}
+    fn record_str(&mut self, _field: &tracing::field::Field, _value: &str) {}
+    fn record_error(&mut self, _field: &tracing::field::Field, _value: &(dyn std::error::Error + 'static)) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S> for WebVisibleFilter {
+    fn enabled(&self, metadata: &Metadata<'_>, _ctx: &tracing_subscriber::layer::Context<'_, S>) -> bool {
+        // Always allow WARN and ERROR to web
+        if metadata.level() >= &Level::WARN {
+            return true;
+        }
+        // For INFO and below, we need to check fields - return true here
+        // and rely on the fact that events without web=true won't be recorded
+        // The actual filtering happens at the event level
+        true
+    }
+    
+    fn event_enabled(&self, event: &tracing::Event<'_>, _ctx: &tracing_subscriber::layer::Context<'_, S>) -> bool {
+        let metadata = event.metadata();
+        
+        // Always allow WARN and ERROR
+        if metadata.level() >= &Level::WARN {
+            return true;
+        }
+        
+        // Check for web=true field
+        let mut checker = WebFieldChecker { has_web_field: false };
+        event.record(&mut checker);
+        
+        checker.has_web_field
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "ololon")]
@@ -138,6 +196,10 @@ enum Commands {
         /// Address to bind the server to
         #[arg(long, env = "OLOLON_BIND_ADDRESS", default_value = "0.0.0.0:3000")]
         bind_address: String,
+
+        /// Path to the log file to serve
+        #[arg(long, env = "OLOLON_LOG_PATH", default_value = "logs/ololon.log")]
+        log_path: String,
     },
 
     /// Validate trained model against all labeled data in database
@@ -150,18 +212,54 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
+    // Create logs directory if it doesn't exist
+    std::fs::create_dir_all("logs").ok();
+
+    // Set up file appender with daily rotation
+    // IMPORTANT: Keep the guard alive for the duration of the program
+    let file_appender = tracing_appender::rolling::daily("logs", "ololon.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Initialize tracing with both stdout and JSON file logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
+        // Human-readable stdout - shows all INFO and above
         .with(tracing_subscriber::fmt::layer())
+        // JSON file logging - only shows web-visible logs (web=true) or WARN/ERROR
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_thread_names(false)
+                .with_filter(WebVisibleFilter),
+        )
         .init();
+
+    // Keep the guard alive - dropping it would stop log writing
+    let _guard = guard;
 
     // Load .env file if present
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
+
+    // Get command name for logging
+    let command_name = match &cli.command {
+        Commands::Collect { .. } => "collect",
+        Commands::Train { .. } => "train",
+        Commands::Trade { .. } => "trade",
+        Commands::Server { .. } => "server",
+        Commands::Validate { .. } => "validate",
+    };
+
+    // Create a span that will add "command" field to all logs within this context
+    let command_span = tracing::info_span!("command", %command_name);
+    let _enter = command_span.enter();
 
     match cli.command {
         Commands::Collect {
@@ -234,11 +332,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Server {
             auth_token,
             bind_address,
+            log_path,
         } => {
             server::run(server::Config {
                 db_path: cli.database,
                 auth_token,
                 bind_address,
+                log_path,
             })
             .await?;
         }

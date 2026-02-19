@@ -151,7 +151,7 @@
 									</Table.Row>
 									{#if trade.error_message}
 										<Table.Row class="bg-destructive/5">
-											<Table.Cell colspan="10" class="text-xs text-destructive">
+											<Table.Cell colspan={10} class="text-xs text-destructive">
 												<div class="flex items-start gap-2">
 													<svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 														<circle cx="12" cy="12" r="10"/>

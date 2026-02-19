@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::db;
 use ordered_float::OrderedFloat;
@@ -502,17 +502,18 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Database writer task (async with ormlite)
     let total_stored_clone = Arc::clone(&total_windows_stored);
-    let db_writer = tokio::spawn(async move {
-        // Open connection once for the writer task
-        let mut conn = match SqliteConnection::connect(&db_path_for_writer.to_string_lossy()).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!(error = ?e, "Failed to open database connection for writer");
-                return;
-            }
-        };
+    let db_writer = tokio::spawn(
+        async move {
+            // Open connection once for the writer task
+            let mut conn = match SqliteConnection::connect(&db_path_for_writer.to_string_lossy()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(error = ?e, "Failed to open database connection for writer");
+                    return;
+                }
+            };
 
-        while let Some(cmd) = db_rx.recv().await {
+            while let Some(cmd) = db_rx.recv().await {
             match cmd {
                 DbCommand::InsertWindow {
                     time_range_start,
@@ -608,7 +609,7 @@ pub async fn run(config: Config) -> Result<()> {
                 DbCommand::Shutdown => break,
             }
         }
-    });
+    }.instrument(tracing::info_span!("db_writer", command_name = "collect")));
 
     // Order book snapshot sampler task
     let ob_sampler_interval = Duration::from_secs(config.ob_sample_interval_secs);
@@ -647,7 +648,7 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
         }
-    });
+    }.instrument(tracing::info_span!("ob_sampler", command_name = "collect")));
 
     // Periodic status logger
     let active_window_clone2 = Arc::clone(&active_window);
@@ -698,7 +699,7 @@ pub async fn run(config: Config) -> Result<()> {
                 );
             }
         }
-    });
+    }.instrument(tracing::info_span!("status_logger", command_name = "collect")));
 
     // Connect to Binance combined WebSocket stream (aggTrade + depth)
     // Using combined stream format: /stream?streams=btcusdt@aggTrade/btcusdt@depth@100ms

@@ -63,3 +63,18 @@ export interface FeatureStats {
 	labeled_count: number;
 	unlabeled_count: number;
 }
+
+export interface LogEntry {
+	raw: string;
+	command: string | null;
+}
+
+// Parsed log entry from JSON
+export interface ParsedLog {
+	timestamp: string;
+	level: string;
+	target: string;
+	message: string;
+	command?: string;
+	spans?: Record<string, unknown>;
+}

@@ -158,6 +158,7 @@ fn format_time(timestamp: i64) -> String {
 /// Main entry point
 pub async fn run(config: TrainConfig) -> Result<()> {
     info!(
+        web = true,
         db_path = %config.db_path,
         model_path = %config.model_path,
         epochs = config.epochs,
@@ -199,6 +200,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     let min_features = *feature_lengths.iter().min().unwrap_or(&config.hidden_size);
 
     info!(
+        web = true,
         total_windows = total_samples,
         up_count,
         down_count,
@@ -222,6 +224,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     let val_up = val_samples.iter().filter(|s| s.target > 0.5).count();
 
     info!(
+        web = true,
         train_count = train_samples.len(),
         train_up,
         train_down = train_samples.len() - train_up,
@@ -334,7 +337,12 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             best_accuracy = accuracy;
         }
 
+        // Console: log every epoch
+        // Web: log every 10 epochs or final epoch
+        let is_web_visible = (epoch + 1) % 10 == 0 || epoch + 1 == config.epochs;
+        
         info!(
+            web = is_web_visible,
             epoch = epoch + 1,
             total_epochs = config.epochs,
             train_loss = format!("{:.4}", avg_train),
@@ -348,7 +356,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     }
 
     // Save model
-    info!(model_path = %config.model_path, "Saving model weights");
+    info!(web = true, model_path = %config.model_path, "Saving model weights");
     let recorder = JsonGzFileRecorder::<FullPrecisionSettings>::new();
     model.save_file(&config.model_path, &recorder).context("Failed to save model")?;
     
@@ -365,6 +373,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
     ).await.ok();
     
     info!(
+        web = true,
         model_path = %config.model_path,
         final_accuracy = format!("{:.2}%", best_accuracy),
         input_size,

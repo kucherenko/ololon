@@ -1,4 +1,4 @@
-import type { Feature, Trade, ModelMetadata, FeatureStats } from '$lib/types';
+import type { Feature, Trade, ModelMetadata, FeatureStats, LogEntry } from '$lib/types';
 import { get } from 'svelte/store';
 import { apiKey } from '$lib/stores/apiKey';
 
@@ -87,4 +87,48 @@ export async function getTrade(id: number): Promise<Trade> {
 
 export async function getModelMetadata(): Promise<ModelMetadata> {
 	return fetchApi<ModelMetadata>('/api/model');
+}
+
+export async function getLogs(lines?: number, command?: string): Promise<LogEntry[]> {
+	const searchParams = new URLSearchParams();
+	if (lines) searchParams.set('lines', lines.toString());
+	if (command) searchParams.set('command', command);
+	
+	const query = searchParams.toString();
+	return fetchApi<LogEntry[]>(`/api/logs${query ? `?${query}` : ''}`);
+}
+
+export function createLogStream(
+	onMessage: (log: string) => void,
+	onError?: (error: Error) => void,
+	command?: string
+): EventSource {
+	const token = get(apiKey);
+	let url = `${API_URL}/api/logs/stream?token=${encodeURIComponent(token || '')}`;
+	if (command) {
+		url += `&command=${encodeURIComponent(command)}`;
+	}
+	
+	// EventSource doesn't support headers, so we pass token as query param for SSE
+	const eventSource = new EventSource(url);
+	
+	eventSource.onmessage = (event) => {
+		onMessage(event.data);
+	};
+	
+	eventSource.onerror = () => {
+		// Check if it's an auth error (readyState will be CLOSED after failed connect)
+		if (eventSource.readyState === EventSource.CLOSED) {
+			if (onError) {
+				onError(new Error('SSE connection closed - check authentication'));
+			}
+		}
+	};
+	
+	eventSource.onopen = () => {
+		// Connection established successfully
+		console.log('SSE connection established');
+	};
+	
+	return eventSource;
 }
