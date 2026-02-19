@@ -49,6 +49,10 @@ enum Commands {
         /// Labeling delay in seconds (default: 300 = 5 minutes)
         #[arg(long, env = "OLOLON_LABEL_DELAY_SECS", default_value = "300")]
         label_delay_secs: u64,
+
+        /// Order book sampling interval in seconds
+        #[arg(long, env = "OLOLON_OB_SAMPLE_INTERVAL", default_value = "5")]
+        ob_sample_interval_secs: u64,
     },
 
     /// Train the LSTM model on collected labeled data
@@ -165,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
             symbol,
             window_size,
             label_delay_secs,
+            ob_sample_interval_secs,
         } => {
             collect::run(collect::Config {
                 db_path: cli.database,
@@ -172,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 symbol,
                 window_size,
                 label_delay_secs,
+                ob_sample_interval_secs,
             })
             .await?;
         }
