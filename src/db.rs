@@ -8,7 +8,7 @@
 use anyhow::Result;
 use ormlite::model::*;
 use ormlite::query_builder::OnConflict;
-use ormlite::sqlite::SqliteConnection;
+pub use ormlite::sqlite::SqliteConnection;
 use ormlite::{Connection, Executor};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -47,7 +47,8 @@ pub async fn init_db(db_path: &str) -> Result<SqliteConnection> {
             target INTEGER,
             num_points INTEGER NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            labeled_at INTEGER
+            labeled_at INTEGER,
+            trained_at INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_features_time_range_start ON features(time_range_start);
@@ -69,6 +70,10 @@ pub async fn init_db(db_path: &str) -> Result<SqliteConnection> {
             order_id TEXT,
             tx_hash TEXT,
             error_message TEXT,
+            is_dry_run INTEGER NOT NULL DEFAULT 0,
+            settled INTEGER NOT NULL DEFAULT 0,
+            settlement_price REAL,
+            profit_loss REAL,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );
 
@@ -81,12 +86,18 @@ pub async fn init_db(db_path: &str) -> Result<SqliteConnection> {
             final_train_loss REAL NOT NULL,
             final_val_loss REAL,
             hidden_size INTEGER NOT NULL,
+            input_size INTEGER NOT NULL,
             num_layers INTEGER NOT NULL,
             window_duration_secs INTEGER NOT NULL
         );
         "#,
     )
     .await?;
+
+    // Migration: Add input_size column if it doesn't exist (for existing databases)
+    conn.execute(
+        "ALTER TABLE model_metadata ADD COLUMN input_size INTEGER NOT NULL DEFAULT 0"
+    ).await.ok(); // ok() because it will fail if column already exists
 
     Ok(conn)
 }
@@ -108,6 +119,8 @@ pub struct Feature {
     #[ormlite(default)]
     pub created_at: i64,
     pub labeled_at: Option<i64>,
+    /// Timestamp when this feature was used for training (None = not yet trained)
+    pub trained_at: Option<i64>,
 }
 
 /// Trade record for database operations (main struct for reads)
@@ -129,6 +142,10 @@ pub struct Trade {
     pub order_id: Option<String>,
     pub tx_hash: Option<String>,
     pub error_message: Option<String>,
+    pub is_dry_run: bool,
+    pub settled: bool,
+    pub settlement_price: Option<f64>,
+    pub profit_loss: Option<f64>,
     #[ormlite(default)]
     pub created_at: i64,
 }
@@ -146,6 +163,7 @@ pub struct ModelMetadata {
     pub final_train_loss: f64,
     pub final_val_loss: Option<f64>,
     pub hidden_size: i32,
+    pub input_size: i32,
     pub num_layers: i32,
     pub window_duration_secs: i64,
 }
@@ -169,6 +187,7 @@ pub async fn insert_feature(
         target: None,
         num_points: num_points as i32,
         labeled_at: None,
+        trained_at: None,
     }
     .insert(&mut *conn)
     .await
@@ -228,6 +247,54 @@ pub async fn fetch_labeled_features(conn: &mut SqliteConnection) -> Result<Vec<F
     Ok(features)
 }
 
+/// Fetch labeled features that have not been used for training yet
+pub async fn fetch_untrained_labeled_features(conn: &mut SqliteConnection) -> Result<Vec<Feature>> {
+    let features = Feature::select()
+        .where_("target IS NOT NULL AND trained_at IS NULL")
+        .order_asc("time_range_start")
+        .fetch_all(conn)
+        .await?;
+    Ok(features)
+}
+
+/// Fetch labeled features created after a specific timestamp (for validation on new data)
+#[allow(dead_code)]
+pub async fn fetch_labeled_features_after(conn: &mut SqliteConnection, after_timestamp: i64) -> Result<Vec<Feature>> {
+    let features = Feature::select()
+        .where_("target IS NOT NULL AND time_range_start > ?")
+        .bind(after_timestamp)
+        .order_asc("time_range_start")
+        .fetch_all(conn)
+        .await?;
+    Ok(features)
+}
+
+/// Mark features as trained by setting their trained_at timestamp
+pub async fn mark_features_as_trained(
+    conn: &mut SqliteConnection,
+    feature_ids: &[i64],
+    trained_at: i64,
+) -> Result<()> {
+    if feature_ids.is_empty() {
+        return Ok(());
+    }
+    
+    // Build placeholders for IN clause
+    let placeholders: Vec<String> = feature_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "UPDATE features SET trained_at = ? WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+    
+    let mut query = ormlite::query(&sql).bind(trained_at);
+    for &id in feature_ids {
+        query = query.bind(id);
+    }
+    query.execute(conn).await?;
+    
+    Ok(())
+}
+
 /// Count labeled features
 #[allow(dead_code)]
 pub async fn count_labeled_features(conn: &mut SqliteConnection) -> Result<i64> {
@@ -273,6 +340,10 @@ pub struct TradeRecord {
     pub order_id: Option<String>,
     pub tx_hash: Option<String>,
     pub error_message: Option<String>,
+    pub is_dry_run: bool,
+    pub settled: bool,
+    pub settlement_price: Option<f64>,
+    pub profit_loss: Option<f64>,
 }
 
 /// Insert a trade record using the ORM insert struct
@@ -291,6 +362,10 @@ pub async fn insert_trade(conn: &mut SqliteConnection, trade: &TradeRecord) -> R
         order_id: trade.order_id.clone(),
         tx_hash: trade.tx_hash.clone(),
         error_message: trade.error_message.clone(),
+        is_dry_run: trade.is_dry_run,
+        settled: trade.settled,
+        settlement_price: trade.settlement_price,
+        profit_loss: trade.profit_loss,
     }
     .insert(&mut *conn)
     .await?;
@@ -321,6 +396,7 @@ pub async fn save_model_metadata(
     final_train_loss: f64,
     final_val_loss: Option<f64>,
     hidden_size: usize,
+    input_size: usize,
     num_layers: usize,
     window_duration_secs: i64,
 ) -> Result<()> {
@@ -334,6 +410,7 @@ pub async fn save_model_metadata(
         final_train_loss,
         final_val_loss,
         hidden_size: hidden_size as i32,
+        input_size: input_size as i32,
         num_layers: num_layers as i32,
         window_duration_secs,
     }
@@ -354,7 +431,26 @@ pub async fn get_model_metadata(conn: &mut SqliteConnection) -> Result<Option<(S
     Ok(result.map(|m| (m.model_path, m.window_duration_secs)))
 }
 
-// Re-export for backward compatibility
+/// Get full model metadata including trained_at timestamp
+pub async fn get_full_model_metadata(conn: &mut SqliteConnection) -> Result<Option<ModelMetadata>> {
+    let result = ModelMetadata::select()
+        .where_("id = ?")
+        .bind(1i64)
+        .fetch_optional(conn)
+        .await?;
+    Ok(result)
+}
+
+/// Count features that have not been used for training
+pub async fn count_untrained_features(conn: &mut SqliteConnection) -> Result<i64> {
+    let count: (i64,) = ormlite::query_as(
+        "SELECT COUNT(*) FROM features WHERE target IS NOT NULL AND trained_at IS NULL",
+    )
+    .fetch_one(conn)
+    .await?;
+    Ok(count.0)
+}
+
 #[allow(dead_code)]
 pub type FeatureRecord = Feature;
 
@@ -391,6 +487,7 @@ mod tests {
         .await
         .unwrap();
         assert!(feature.id > 0);
+        assert!(feature.trained_at.is_none());
 
         // Label with end price (price went up)
         let target = apply_label_with_price(&mut conn, feature.id, 50100.0, 1704067600)
@@ -402,5 +499,17 @@ mod tests {
         assert_eq!(features.len(), 1);
         assert_eq!(features[0].target, Some(1));
         assert_eq!(features[0].end_price, Some(50100.0));
+
+        // Test untrained features
+        let untrained = fetch_untrained_labeled_features(&mut conn).await.unwrap();
+        assert_eq!(untrained.len(), 1);
+
+        // Mark as trained
+        mark_features_as_trained(&mut conn, &[feature.id], 1704068000)
+            .await
+            .unwrap();
+
+        let untrained_after = fetch_untrained_labeled_features(&mut conn).await.unwrap();
+        assert_eq!(untrained_after.len(), 0);
     }
 }

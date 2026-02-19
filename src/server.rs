@@ -16,7 +16,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response, sse::Event},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use axum_extra::{
@@ -70,6 +70,15 @@ pub struct TradeQuery {
     pub limit: Option<i64>,
     /// Number of results to skip for pagination
     pub offset: Option<i64>,
+    /// Filter by dry-run status: true = dry-run only, false = real trades only, null = all
+    pub dry_run: Option<bool>,
+}
+
+/// Query parameters for settling a trade
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct SettleQuery {
+    /// Settlement price (the actual outcome price at settlement time)
+    pub settlement_price: f64,
 }
 
 /// API error response
@@ -97,6 +106,21 @@ pub struct HealthResponse {
     pub status: String,
 }
 
+/// Trade statistics response
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TradeStats {
+    /// Total number of trades
+    pub total_count: i64,
+    /// Number of dry-run trades
+    pub dry_run_count: i64,
+    /// Number of real trades
+    pub real_trade_count: i64,
+    /// Number of settled dry-run trades
+    pub settled_count: i64,
+    /// Total profit/loss from settled dry-run trades
+    pub total_profit_loss: f64,
+}
+
 /// OpenAPI specification
 #[derive(OpenApi)]
 #[openapi(
@@ -107,6 +131,8 @@ pub struct HealthResponse {
         get_feature_stats,
         list_trades,
         get_trade,
+        settle_trade,
+        get_trade_stats,
         get_model_metadata,
         get_logs,
         stream_logs,
@@ -115,6 +141,7 @@ pub struct HealthResponse {
         schemas(
             ApiError,
             FeatureStats,
+            TradeStats,
             HealthResponse,
             LogEntry,
             db::Feature,
@@ -158,6 +185,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/features/{id}", get(get_feature))
         .route("/trades", get(list_trades))
         .route("/trades/{id}", get(get_trade))
+        .route("/trades/{id}/settle", post(settle_trade))
+        .route("/trades/stats", get(get_trade_stats))
         .route("/model", get(get_model_metadata))
         .route("/logs", get(get_logs))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -430,6 +459,7 @@ async fn list_trades(
     let Query(params) = query.unwrap_or(Query(TradeQuery {
         limit: None,
         offset: None,
+        dry_run: None,
     }));
 
     let limit = params.limit.unwrap_or(100).min(1000);
@@ -437,13 +467,35 @@ async fn list_trades(
 
     let mut conn = state.db.write().await;
 
-    let trades: Vec<db::Trade> = ormlite::query_as(
-        "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&mut *conn)
-    .await
+    let trades: Vec<db::Trade> = match params.dry_run {
+        Some(true) => {
+            ormlite::query_as(
+                "SELECT * FROM trades WHERE is_dry_run = 1 ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *conn)
+            .await
+        }
+        Some(false) => {
+            ormlite::query_as(
+                "SELECT * FROM trades WHERE is_dry_run = 0 ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *conn)
+            .await
+        }
+        None => {
+            ormlite::query_as(
+                "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *conn)
+            .await
+        }
+    }
     .map_err(|e| ApiError {
         error: format!("Database error: {}", e),
     })?;
@@ -489,6 +541,164 @@ async fn get_trade(
             error: "Trade not found".to_string(),
         }),
     }
+}
+
+/// Settle a dry-run trade with the actual market outcome
+///
+/// Calculates profit/loss based on the settlement price and updates the trade record.
+/// Requires Bearer token authentication.
+#[utoipa::path(
+    post,
+    path = "/api/trades/{id}/settle",
+    params(
+        ("id" = i64, Path, description = "Trade ID"),
+        SettleQuery
+    ),
+    responses(
+        (status = 200, description = "Trade settled successfully", body = db::Trade),
+        (status = 401, description = "Unauthorized", body = ApiError),
+        (status = 404, description = "Trade not found", body = ApiError),
+        (status = 400, description = "Cannot settle non-dry-run trade", body = ApiError)
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn settle_trade(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    query: Query<SettleQuery>,
+) -> Result<Json<db::Trade>, ApiError> {
+    let mut conn = state.db.write().await;
+
+    // Check if trade exists and is a dry-run trade
+    let trade: Option<db::Trade> = ormlite::query_as("SELECT * FROM trades WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| ApiError {
+            error: format!("Database error: {}", e),
+        })?;
+
+    let trade = match trade {
+        Some(t) => t,
+        None => {
+            return Err(ApiError {
+                error: "Trade not found".to_string(),
+            });
+        }
+    };
+
+    // Only allow settling dry-run trades
+    if !trade.is_dry_run {
+        return Err(ApiError {
+            error: "Cannot settle non-dry-run trade".to_string(),
+        });
+    }
+
+    if trade.settled {
+        return Err(ApiError {
+            error: "Trade already settled".to_string(),
+        });
+    }
+
+    // Calculate profit/loss
+    let profit_loss = if trade.outcome == "YES" {
+        if query.settlement_price >= 1.0 {
+            trade.trade_size * (1.0 - trade.avg_price)
+        } else {
+            -trade.trade_size * trade.avg_price
+        }
+    } else {
+        if query.settlement_price < 1.0 {
+            trade.trade_size * (1.0 - trade.avg_price)
+        } else {
+            -trade.trade_size * trade.avg_price
+        }
+    };
+
+    // Update the trade
+    ormlite::query(
+        "UPDATE trades SET settled = 1, settlement_price = ?, profit_loss = ? WHERE id = ?"
+    )
+    .bind(query.settlement_price)
+    .bind(profit_loss)
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ApiError {
+        error: format!("Database error: {}", e),
+    })?;
+
+    // Fetch updated trade
+    let updated_trade: db::Trade = ormlite::query_as("SELECT * FROM trades WHERE id = ?")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| ApiError {
+            error: format!("Database error: {}", e),
+        })?;
+
+    Ok(Json(updated_trade))
+}
+
+/// Get trade statistics
+///
+/// Returns aggregate statistics about trades including dry-run and real trades.
+/// Requires Bearer token authentication.
+#[utoipa::path(
+    get,
+    path = "/api/trades/stats",
+    responses(
+        (status = 200, description = "Trade statistics", body = TradeStats),
+        (status = 401, description = "Unauthorized", body = ApiError)
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn get_trade_stats(State(state): State<AppState>) -> Result<Json<TradeStats>, ApiError> {
+    let mut conn = state.db.write().await;
+
+    let total: (i64,) = ormlite::query_as("SELECT COUNT(*) FROM trades")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| ApiError {
+            error: format!("Database error: {}", e),
+        })?;
+
+    let dry_run: (i64,) = ormlite::query_as("SELECT COUNT(*) FROM trades WHERE is_dry_run = 1")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| ApiError {
+            error: format!("Database error: {}", e),
+        })?;
+
+    let settled: (i64,) = ormlite::query_as("SELECT COUNT(*) FROM trades WHERE is_dry_run = 1 AND settled = 1")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| ApiError {
+            error: format!("Database error: {}", e),
+        })?;
+
+    let profit_loss: (Option<f64>,) = ormlite::query_as(
+        "SELECT SUM(profit_loss) FROM trades WHERE is_dry_run = 1 AND settled = 1"
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| ApiError {
+        error: format!("Database error: {}", e),
+    })?;
+
+    let stats = TradeStats {
+        total_count: total.0,
+        dry_run_count: dry_run.0,
+        real_trade_count: total.0 - dry_run.0,
+        settled_count: settled.0,
+        total_profit_loss: profit_loss.0.unwrap_or(0.0),
+    };
+
+    Ok(Json(stats))
 }
 
 /// Get model metadata

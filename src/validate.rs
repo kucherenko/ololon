@@ -25,6 +25,8 @@ pub struct ValidateConfig {
     pub db_path: String,
     pub model_path: String,
     pub hidden_size: usize,
+    /// Only validate on new data not used for training
+    pub new_only: bool,
 }
 
 /// Validation sample with metadata
@@ -141,6 +143,7 @@ fn run_inference<B: Backend>(
             target: s.target,
             time_range_start: s.time_range_start,
             num_points: s.features.len(),
+            feature_id: 0, // Not needed for inference
         })
         .collect();
 
@@ -168,21 +171,64 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
     println!("  Database: {}", config.db_path);
     println!("  Model: {}", config.model_path);
     println!("  Hidden size: {}", config.hidden_size);
+    if config.new_only {
+        println!("  Mode: NEW DATA ONLY (not used for training)");
+    }
     println!();
 
     // Initialize database
     let mut conn = db::init_db(&config.db_path).await?;
 
-    // Load all labeled features
-    let labeled_features = db::fetch_labeled_features(&mut conn)
-        .await
-        .context("Failed to fetch labeled features from database")?;
-
-    if labeled_features.is_empty() {
-        anyhow::bail!("No labeled features found in database. Run 'ololon collect' first.");
+    // Get model metadata to show creation date
+    let model_metadata = db::get_full_model_metadata(&mut conn).await?;
+    
+    if let Some(ref metadata) = model_metadata {
+        let trained_date = Utc.timestamp_opt(metadata.trained_at, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| metadata.trained_at.to_string());
+        println!("MODEL INFO");
+        println!("  Trained at: {}", trained_date);
+        println!("  Epochs: {}", metadata.epochs);
+        println!("  Hidden size: {}", metadata.hidden_size);
+        println!("  Input size: {}", metadata.input_size);
+        println!("  Final train loss: {:.6}", metadata.final_train_loss);
+        if let Some(val_loss) = metadata.final_val_loss {
+            println!("  Final val loss: {:.6}", val_loss);
+        }
+        println!();
+    } else {
+        println!("WARNING: No model metadata found in database. Model may not have been trained with this version.\n");
     }
 
-    println!("Loaded {} labeled features from database\n", labeled_features.len());
+    // Load labeled features based on mode
+    let labeled_features = if config.new_only {
+        db::fetch_untrained_labeled_features(&mut conn)
+            .await
+            .context("Failed to fetch untrained labeled features from database")?
+    } else {
+        db::fetch_labeled_features(&mut conn)
+            .await
+            .context("Failed to fetch labeled features from database")?
+    };
+
+    if labeled_features.is_empty() {
+        if config.new_only {
+            anyhow::bail!("No new labeled features found (all data has been used for training). Run 'ololon collect' to gather more data.");
+        } else {
+            anyhow::bail!("No labeled features found in database. Run 'ololon collect' first.");
+        }
+    }
+
+    // Show data statistics
+    let total_labeled = db::count_labeled_features(&mut conn).await?;
+    let untrained_count = db::count_untrained_features(&mut conn).await?;
+    
+    println!("DATA STATISTICS");
+    println!("  Total labeled features: {}", total_labeled);
+    println!("  Untrained features: {}", untrained_count);
+    println!("  Validating on: {} samples", labeled_features.len());
+    println!();
 
     // Convert to validation samples
     let samples: Vec<ValidationSample> = labeled_features
@@ -197,9 +243,30 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
         })
         .collect();
 
-    // Determine input size from data
-    let max_feature_len = samples.iter().map(|s| s.features.len()).max().unwrap_or(config.hidden_size);
-    let input_size = max_feature_len.max(config.hidden_size);
+    // Determine input size from model metadata (not from validation data)
+    // This ensures the model architecture matches what was trained
+    
+    // For legacy models where input_size=0, compute from ALL labeled features (not just validation set)
+    // because the model was trained with the full dataset's feature dimensions
+    let all_labeled_features = db::fetch_labeled_features(&mut conn)
+        .await
+        .context("Failed to fetch all labeled features")?;
+    let max_feature_len_all = all_labeled_features
+        .iter()
+        .map(|f| f.feature_vector.len())
+        .max()
+        .unwrap_or(config.hidden_size);
+    let computed_input_size = max_feature_len_all.max(config.hidden_size);
+    
+    let input_size = model_metadata
+        .as_ref()
+        .and_then(|m| {
+            let size = m.input_size as usize;
+            // Fall back to computed size if metadata has invalid input_size (0 or less)
+            if size > 0 { Some(size) } else { None }
+        })
+        .unwrap_or(computed_input_size);
+    
     println!("Using input size: {}\n", input_size);
 
     // Load model

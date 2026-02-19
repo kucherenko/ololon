@@ -45,6 +45,8 @@ pub struct Sample {
     pub target: f32,
     pub time_range_start: i64,
     pub num_points: usize,
+    /// Database ID of the feature record (for marking as trained)
+    pub feature_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,7 +168,8 @@ pub async fn run(config: TrainConfig) -> Result<()> {
         learning_rate = config.learning_rate,
         hidden_size = config.hidden_size,
         validation_split = config.validation_split,
-        "Starting model training on 5-minute time windows"
+        "Starting training: {} epochs, batch_size={}, lr={}, hidden={}",
+        config.epochs, config.batch_size, config.learning_rate, config.hidden_size
     );
 
     // Load labeled features from database
@@ -187,6 +190,7 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             target: f.target.unwrap() as f32,
             time_range_start: f.time_range_start,
             num_points: f.num_points as usize,
+            feature_id: f.id,
         })
         .collect();
 
@@ -208,7 +212,10 @@ pub async fn run(config: TrainConfig) -> Result<()> {
         feature_length_range = format!("{}-{}", min_features, max_features),
         first_window = format_time(samples.first().map(|s| s.time_range_start).unwrap_or(0)),
         last_window = format_time(samples.last().map(|s| s.time_range_start).unwrap_or(0)),
-        "Dataset statistics"
+        "Loaded {} samples: {} up / {} down ({}-{})",
+        total_samples, up_count, down_count, 
+        format_time(samples.first().map(|s| s.time_range_start).unwrap_or(0)),
+        format_time(samples.last().map(|s| s.time_range_start).unwrap_or(0))
     );
 
     // Determine input size: use max feature length or user-specified
@@ -237,7 +244,9 @@ pub async fn run(config: TrainConfig) -> Result<()> {
         val_range = format!("{} to {}",
             format_time(val_samples.first().map(|s| s.time_range_start).unwrap_or(0)),
             format_time(val_samples.last().map(|s| s.time_range_start).unwrap_or(0))),
-        "Split dataset chronologically"
+        "Split: {} train ({} up/{} down), {} validation ({} up/{} down)",
+        train_samples.len(), train_up, train_samples.len() - train_up,
+        val_samples.len(), val_up, val_samples.len() - val_up
     );
 
     // Initialize device and model
@@ -337,28 +346,52 @@ pub async fn run(config: TrainConfig) -> Result<()> {
             best_accuracy = accuracy;
         }
 
-        // Console: log every epoch
-        // Web: log every 10 epochs or final epoch
+        // Console: log every epoch with structured fields
+        // Web: log every 10 epochs or final epoch with summary message
         let is_web_visible = (epoch + 1) % 10 == 0 || epoch + 1 == config.epochs;
         
-        info!(
-            web = is_web_visible,
-            epoch = epoch + 1,
-            total_epochs = config.epochs,
-            train_loss = format!("{:.4}", avg_train),
-            val_loss = format!("{:.4}", avg_val),
-            accuracy = format!("{:.2}%", accuracy),
-            up_accuracy = format!("{:.2}%", up_acc),
-            down_accuracy = format!("{:.2}%", down_acc),
-            best = format!("{:.2}%", best_accuracy),
-            "Training progress"
-        );
+        if is_web_visible {
+            // Web-visible: include key metrics in message for better display
+            info!(
+                web = true,
+                epoch = epoch + 1,
+                total_epochs = config.epochs,
+                train_loss = format!("{:.4}", avg_train),
+                val_loss = format!("{:.4}", avg_val),
+                accuracy = format!("{:.2}%", accuracy),
+                up_accuracy = format!("{:.2}%", up_acc),
+                down_accuracy = format!("{:.2}%", down_acc),
+                best = format!("{:.2}%", best_accuracy),
+                "Epoch {}/{}: accuracy={:.1}%, loss={:.4}, best={:.1}%",
+                epoch + 1,
+                config.epochs,
+                accuracy,
+                avg_val,
+                best_accuracy
+            );
+        } else {
+            // Console-only: structured fields
+            info!(
+                epoch = epoch + 1,
+                total_epochs = config.epochs,
+                train_loss = format!("{:.4}", avg_train),
+                val_loss = format!("{:.4}", avg_val),
+                accuracy = format!("{:.2}%", accuracy),
+                up_accuracy = format!("{:.2}%", up_acc),
+                down_accuracy = format!("{:.2}%", down_acc),
+                best = format!("{:.2}%", best_accuracy),
+                "Training progress"
+            );
+        }
     }
 
     // Save model
-    info!(web = true, model_path = %config.model_path, "Saving model weights");
+    info!(web = true, "Saving model to {}", config.model_path);
     let recorder = JsonGzFileRecorder::<FullPrecisionSettings>::new();
     model.save_file(&config.model_path, &recorder).context("Failed to save model")?;
+    
+    // Get the trained_at timestamp
+    let trained_at = chrono::Utc::now().timestamp();
     
     // Save model metadata to database
     db::save_model_metadata(
@@ -368,9 +401,18 @@ pub async fn run(config: TrainConfig) -> Result<()> {
         final_train_loss as f64,
         Some(final_val_loss as f64),
         config.hidden_size,
+        input_size,
         config.num_layers,
         300, // 5-minute window duration
     ).await.ok();
+    
+    // Mark all used features as trained
+    let feature_ids: Vec<i64> = samples.iter().map(|s| s.feature_id).collect();
+    if let Err(e) = db::mark_features_as_trained(&mut conn, &feature_ids, trained_at).await {
+        tracing::warn!(error = ?e, "Failed to mark features as trained");
+    } else {
+        info!(web = true, count = feature_ids.len(), "Marked {} features as trained", feature_ids.len());
+    }
     
     info!(
         web = true,
@@ -378,7 +420,8 @@ pub async fn run(config: TrainConfig) -> Result<()> {
         final_accuracy = format!("{:.2}%", best_accuracy),
         input_size,
         hidden_size = config.hidden_size,
-        "Model training complete!"
+        "Training complete! Best accuracy: {:.1}%, model saved to {}",
+        best_accuracy, config.model_path
     );
     
     Ok(())

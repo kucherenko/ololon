@@ -46,6 +46,7 @@ pub struct TradeConfig {
     pub private_key: Option<String>,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -252,7 +253,9 @@ impl<B: Backend> PriceBatcher<B> {
 pub async fn run(config: TradeConfig) -> Result<()> {
     info!(model_path = %config.model_path, "Starting trading bot");
 
-    if config.private_key.is_none() || config.api_key.is_none() || config.api_secret.is_none() {
+    if config.dry_run {
+        info!("DRY RUN MODE - No real trades will be placed");
+    } else if config.private_key.is_none() || config.api_key.is_none() || config.api_secret.is_none() {
         warn!("Missing credentials - inference-only mode");
     }
 
@@ -313,7 +316,7 @@ pub async fn run(config: TradeConfig) -> Result<()> {
 
                 info!(prob_up = format!("{:.4}", prob), "Prediction");
 
-                if let Err(e) = trade_logic(&config, &poly, prob, last_trade.clone()).await {
+                if let Err(e) = trade_logic(&config, &poly, prob, last_trade.clone(), &mut conn).await {
                     error!(error = ?e, "Trade error");
                 }
             }
@@ -322,7 +325,13 @@ pub async fn run(config: TradeConfig) -> Result<()> {
     Ok(())
 }
 
-async fn trade_logic(cfg: &TradeConfig, poly: &PolymarketClient, prob: f32, last: Arc<RwLock<i64>>) -> Result<()> {
+async fn trade_logic(
+    cfg: &TradeConfig,
+    poly: &PolymarketClient,
+    prob: f32,
+    last: Arc<RwLock<i64>>,
+    conn: &mut db::SqliteConnection,
+) -> Result<()> {
     let now = Utc::now().timestamp();
     if *last.read().await > now - 60 { return Ok(()); }
 
@@ -331,17 +340,74 @@ async fn trade_logic(cfg: &TradeConfig, poly: &PolymarketClient, prob: f32, last
     let no: f64 = mkt.outcome_prices.get(1).and_then(|p| p.parse().ok()).unwrap_or(0.5);
     let tid = mkt.tokens.first().map(|t| t.token_id.as_str()).unwrap_or(&mkt.condition_id);
 
-    let (out, edge, price, tok) = if prob as f64 - yes > cfg.min_edge {
+    let (outcome, edge, price, tok) = if prob as f64 - yes > cfg.min_edge {
         ("YES", prob as f64 - yes, yes, tid.to_string())
     } else if (1.0 - prob as f64) - no > cfg.min_edge {
         let nt = mkt.tokens.get(1).map(|t| t.token_id.as_str()).unwrap_or(&mkt.condition_id);
         ("NO", (1.0 - prob as f64) - no, no, nt.to_string())
     } else { return Ok(()); };
 
-    if cfg.private_key.is_none() { info!(out, edge = format!("{:.4}", edge), "DRY RUN"); return Ok(()); }
+    // Dry-run mode: create mock trade record
+    if cfg.dry_run {
+        let trade_record = db::TradeRecord {
+            id: None,
+            timestamp: now,
+            market_id: mkt.id.clone(),
+            outcome: outcome.to_string(),
+            predicted_prob: prob as f64,
+            market_prob: price,
+            edge,
+            trade_size: cfg.trade_size,
+            avg_price: price,
+            status: "pending".to_string(),
+            order_id: Some(format!("mock_{}", uuid::Uuid::new_v4())),
+            tx_hash: None,
+            error_message: None,
+            is_dry_run: true,
+            settled: false,
+            settlement_price: None,
+            profit_loss: None,
+        };
+        let trade_id = db::insert_trade(conn, &trade_record).await?;
+        info!(trade_id, outcome, edge = format!("{:.4}", edge), price = format!("{:.4}", price), "DRY RUN - Mock trade created");
+        *last.write().await = now;
+        return Ok(());
+    }
+
+    // Real trade mode - requires credentials
+    if cfg.private_key.is_none() { 
+        info!(outcome, edge = format!("{:.4}", edge), "DRY RUN (no credentials)"); 
+        return Ok(()); 
+    }
 
     match poly.place_order(&mkt.id, &tok, "BUY", cfg.trade_size, price * 1.01).await {
-        Ok(id) => { info!(id, out, "Order"); *last.write().await = now; }
+        Ok(order_id) => { 
+            info!(order_id, outcome, "Order placed"); 
+            
+            // Store real trade in database
+            let trade_record = db::TradeRecord {
+                id: None,
+                timestamp: now,
+                market_id: mkt.id.clone(),
+                outcome: outcome.to_string(),
+                predicted_prob: prob as f64,
+                market_prob: price,
+                edge,
+                trade_size: cfg.trade_size,
+                avg_price: price * 1.01,
+                status: "pending".to_string(),
+                order_id: Some(order_id.clone()),
+                tx_hash: None,
+                error_message: None,
+                is_dry_run: false,
+                settled: false,
+                settlement_price: None,
+                profit_loss: None,
+            };
+            db::insert_trade(conn, &trade_record).await?;
+            
+            *last.write().await = now; 
+        }
         Err(e) => { error!(error = ?e, "Order failed"); }
     }
     Ok(())

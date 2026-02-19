@@ -185,6 +185,10 @@ enum Commands {
         /// Polymarket L2 API secret (or set POLY_API_SECRET env var)
         #[arg(long, env = "POLY_API_SECRET")]
         api_secret: Option<String>,
+
+        /// Run in dry-run mode without placing real trades (or set DRY_RUN=1)
+        #[arg(long, env = "DRY_RUN")]
+        dry_run: bool,
     },
 
     /// Start the REST API server with authentication
@@ -207,6 +211,10 @@ enum Commands {
         /// Hidden size for LSTM inference (must match trained model)
         #[arg(long, env = "OLOLON_HIDDEN_SIZE", default_value = "64")]
         hidden_size: usize,
+
+        /// Only validate on new data not used for training
+        #[arg(long)]
+        new_only: bool,
     },
 }
 
@@ -311,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
             private_key,
             api_key,
             api_secret,
+            dry_run,
         } => {
             trade::run(trade::TradeConfig {
                 db_path: cli.database,
@@ -326,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
                 private_key,
                 api_key,
                 api_secret,
+                dry_run,
             })
             .await?;
         }
@@ -342,11 +352,12 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
         }
-        Commands::Validate { hidden_size } => {
+        Commands::Validate { hidden_size, new_only } => {
             validate::run(validate::ValidateConfig {
                 db_path: cli.database,
                 model_path: cli.model,
                 hidden_size,
+                new_only,
             })
             .await?;
         }
