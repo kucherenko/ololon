@@ -1,38 +1,37 @@
-# Multi-stage build for SvelteKit application
+# Multi-stage build for SvelteKit application using Bun
 
 # Stage 1: Build
-FROM node:22-alpine AS builder
+FROM oven/bun:1-alpine AS builder
 
 WORKDIR /app
 
 # Copy package files
-COPY package*.json ./
+COPY package.json bun.lock ./
 
-# Install all dependencies including optional native modules for Alpine (musl)
-# Delete package-lock to force npm to resolve optional deps for current platform
-RUN rm -f package-lock.json && npm install
+# Install dependencies
+RUN bun install --frozen-lockfile
 
 # Copy source code
 COPY . .
 
 # Build the application
-RUN npm run build
+RUN bun run build
 
 # Stage 2: Production
-FROM node:22-alpine AS production
+FROM oven/bun:1-alpine AS production
 
 WORKDIR /app
 
 # Create non-root user
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser --system --uid 1001 sveltekit
+RUN addgroup --system --gid 1001 bunjs && \
+    adduser --system --uid 1001 sveltekit -G bunjs
 
 # Copy built application
-COPY --from=builder --chown=sveltekit:nodejs /app/build ./build
-COPY --from=builder --chown=sveltekit:nodejs /app/package*.json ./
+COPY --from=builder --chown=sveltekit:bunjs /app/build ./build
+COPY --from=builder --chown=sveltekit:bunjs /app/package.json /app/bun.lock ./
 
 # Install production dependencies only
-RUN npm ci --omit=dev
+RUN bun install --frozen-lockfile --production
 
 USER sveltekit
 
@@ -45,4 +44,4 @@ ENV NODE_ENV=production \
     HOST=0.0.0.0
 
 # Start the server
-CMD ["node", "build"]
+CMD ["bun", "run", "build/index.js"]
