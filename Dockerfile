@@ -26,8 +26,4 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/ololon /usr/local/bin/ololon
 
-# Create data and logs directories with open permissions
-# This allows the container to write when host directory is mounted
-RUN mkdir -p /app/data /app/logs && chmod 777 /app/data /app/logs
-
 ENTRYPOINT ["ololon"]
