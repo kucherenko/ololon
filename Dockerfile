@@ -2,8 +2,8 @@ FROM rust:1.93-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies (native-tls for websocket, openssl for ormlite/sqlite)
-RUN apt-get update && apt-get install -y pkg-config libssl-dev libsqlite3-dev && rm -rf /var/lib/apt/lists/*
+# Install build dependencies (native-tls for websocket, openssl for ormlite/sqlite, curl for utoipa-swagger-ui)
+RUN apt-get update && apt-get install -y pkg-config libssl-dev libsqlite3-dev curl && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
