@@ -14,7 +14,9 @@ RUN cargo build --release && rm -rf src
 
 # Copy actual source and build
 COPY src ./src
-RUN cargo build --release
+
+# Force recompilation by touching source files
+RUN find src -name "*.rs" -exec touch {} \; && cargo build --release
 
 FROM debian:bookworm-slim
 
