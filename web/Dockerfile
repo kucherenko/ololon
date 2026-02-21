@@ -8,8 +8,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (including optional native rollup for Alpine)
+RUN npm ci && npm install @rollup/rollup-linux-x64-musl --save-optional
 
 # Copy source code
 COPY . .
