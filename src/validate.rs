@@ -15,7 +15,7 @@ use chrono::{TimeZone, Timelike, Utc};
 use std::collections::HashMap;
 
 use crate::db;
-use crate::train::{PriceBatcher, PricePredictor, PricePredictorConfig};
+use crate::model::{PriceBatcher, PricePredictor, PricePredictorConfig, Sample};
 
 type MyBackend = NdArray<f32>;
 
@@ -39,6 +39,18 @@ struct ValidationSample {
     time_range_end: i64,
     start_price: f64,
     end_price: f64,
+}
+
+impl From<&ValidationSample> for Sample {
+    fn from(s: &ValidationSample) -> Self {
+        Sample {
+            features: s.features.clone(),
+            target: s.target,
+            time_range_start: s.time_range_start,
+            num_points: s.features.len(),
+            feature_id: 0,
+        }
+    }
 }
 
 /// Confusion matrix statistics
@@ -135,16 +147,10 @@ fn run_inference<B: Backend>(
     batcher: &PriceBatcher<B>,
     samples: &[ValidationSample],
 ) -> Result<Vec<(f32, f32)>> {
-    // Use the batcher from train.rs but need to handle ValidationSample
-    let train_samples: Vec<crate::train::Sample> = samples
+    // Convert ValidationSample to Sample for batching
+    let train_samples: Vec<Sample> = samples
         .iter()
-        .map(|s| crate::train::Sample {
-            features: s.features.clone(),
-            target: s.target,
-            time_range_start: s.time_range_start,
-            num_points: s.features.len(),
-            feature_id: 0, // Not needed for inference
-        })
+        .map(Sample::from)
         .collect();
 
     let mut predictions = Vec::new();
@@ -272,8 +278,8 @@ pub async fn run(config: ValidateConfig) -> Result<()> {
     // Load model
     println!("Loading trained model...");
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let model_config = PricePredictorConfig::new(input_size, config.hidden_size);
-    let model = model_config.init::<MyBackend>(&device);
+    let model_config = PricePredictorConfig { input_size, hidden_size: config.hidden_size };
+    let model = model_config.init(&device);
 
     let recorder = JsonGzFileRecorder::<FullPrecisionSettings>::new();
     let model = model.load_file(&config.model_path, &recorder, &device)

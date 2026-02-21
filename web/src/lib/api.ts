@@ -2,7 +2,7 @@ import type { Feature, Trade, ModelMetadata, FeatureStats, LogEntry } from '$lib
 import { get } from 'svelte/store';
 import { apiKey } from '$lib/stores/apiKey';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+// Use relative paths - Vite dev proxy and SvelteKit hooks.server.ts handle routing
 
 class ApiError extends Error {
 	status: number;
@@ -24,7 +24,7 @@ async function fetchApi<T>(path: string): Promise<T> {
 		headers['Authorization'] = `Bearer ${token}`;
 	}
 	
-	const response = await fetch(`${API_URL}${path}`, { headers });
+	const response = await fetch(path, { headers });
 	
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -40,12 +40,12 @@ async function fetchApi<T>(path: string): Promise<T> {
 }
 
 export async function getHealth(): Promise<{ status: string }> {
-	const response = await fetch(`${API_URL}/health`);
+	const response = await fetch('/health');
 	return response.json();
 }
 
 export async function verifyApiKey(token: string): Promise<boolean> {
-	const response = await fetch(`${API_URL}/api/features/stats?limit=1`, {
+	const response = await fetch('/api/features/stats?limit=1', {
 		headers: {
 			'Authorization': `Bearer ${token}`,
 			'Content-Type': 'application/json'
@@ -104,7 +104,7 @@ export function createLogStream(
 	command?: string
 ): EventSource {
 	const token = get(apiKey);
-	let url = `${API_URL}/api/logs/stream?token=${encodeURIComponent(token || '')}`;
+	let url = `/api/logs/stream?token=${encodeURIComponent(token || '')}`;
 	if (command) {
 		url += `&command=${encodeURIComponent(command)}`;
 	}

@@ -1,34 +1,150 @@
+# ==============================================================================
+# Ololon Docker Compose
+# ==============================================================================
+# Usage:
+#   docker compose up -d              # Start collect, server, web
+#   docker compose --profile tools up # Include train, trade, validate
+#   docker compose up train           # Run one-off training
+#   docker compose logs -f collect    # Follow logs
+# ==============================================================================
+
 services:
+  # ============================================================================
+  # Core Services (started by default)
+  # ============================================================================
+
   collect:
     build: .
     container_name: ololon-collect
     restart: unless-stopped
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
     command: ["collect"]
     environment:
-      - RUST_LOG=info
+      # Global
+      - RUST_LOG=${RUST_LOG:-info}
+      - OLOLON_DATABASE=${OLOLON_DATABASE:-./data/ololon.db}
+      - OLOLON_MODEL=${OLOLON_MODEL:-./data/model.json.gz}
+      # Collect-specific
+      - OLOLON_WS_URL=${OLOLON_WS_URL:-wss://stream.binance.com:9443/ws}
+      - OLOLON_SYMBOL=${OLOLON_SYMBOL:-btcusdt}
+      - OLOLON_WINDOW_SIZE=${OLOLON_WINDOW_SIZE:-60}
+      - OLOLON_LABEL_DELAY_SECS=${OLOLON_LABEL_DELAY_SECS:-300}
+      - OLOLON_OB_SAMPLE_INTERVAL=${OLOLON_OB_SAMPLE_INTERVAL:-5}
+
+  server:
+    build: .
+    container_name: ololon-server
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["server"]
+    ports:
+      - "${OLOLON_SERVER_PORT:-3000}"
+    environment:
+      # Global
+      - RUST_LOG=${RUST_LOG:-info}
+      - OLOLON_DATABASE=${OLOLON_DATABASE:-./data/ololon.db}
+      - OLOLON_MODEL=${OLOLON_MODEL:-./data/model.json.gz}
+      # Server-specific
+      - OLOLON_AUTH_TOKEN=${OLOLON_AUTH_TOKEN:?OLOLON_AUTH_TOKEN is required}
+      - OLOLON_BIND_ADDRESS=${OLOLON_BIND_ADDRESS:-0.0.0.0:3000}
+      - OLOLON_LOG_PATH=${OLOLON_LOG_PATH:-logs/ololon.log}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: ololon-web
+    restart: unless-stopped
+    ports:
+      - "${OLOLON_WEB_PORT:-5173}"
+    environment:
+      # Backend URL for server-side proxy (container-to-container)
+      - VITE_API_URL=http://server:3000
+      # Origin for production (public URL)
+      - ORIGIN=${ORIGIN:-http://localhost:5173}
+    depends_on:
+      server:
+        condition: service_healthy
+
+  # ============================================================================
+  # Tool Services (started with --profile tools)
+  # ============================================================================
 
   train:
     build: .
     container_name: ololon-train
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
     command: ["train"]
     profiles:
       - tools
     environment:
-      - RUST_LOG=info
+      # Global
+      - RUST_LOG=${RUST_LOG:-info}
+      - OLOLON_DATABASE=${OLOLON_DATABASE:-./data/ololon.db}
+      - OLOLON_MODEL=${OLOLON_MODEL:-./data/model.json.gz}
+      # Train-specific
+      - OLOLON_EPOCHS=${OLOLON_EPOCHS:-100}
+      - OLOLON_BATCH_SIZE=${OLOLON_BATCH_SIZE:-32}
+      - OLOLON_LEARNING_RATE=${OLOLON_LEARNING_RATE:-0.001}
+      - OLOLON_HIDDEN_SIZE=${OLOLON_HIDDEN_SIZE:-64}
+      - OLOLON_NUM_LAYERS=${OLOLON_NUM_LAYERS:-2}
+      - OLOLON_VALIDATION_SPLIT=${OLOLON_VALIDATION_SPLIT:-0.2}
 
   trade:
     build: .
     container_name: ololon-trade
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
     command: ["trade"]
     profiles:
       - tools
     environment:
-      - RUST_LOG=info
-      # Uncomment and set your Polymarket credentials
-      # - POLYMARKET_PRIVATE_KEY=your_private_key
+      # Global
+      - RUST_LOG=${RUST_LOG:-info}
+      - OLOLON_DATABASE=${OLOLON_DATABASE:-./data/ololon.db}
+      - OLOLON_MODEL=${OLOLON_MODEL:-./data/model.json.gz}
+      # Trade-specific
+      - OLOLON_WS_URL=${OLOLON_WS_URL:-wss://stream.binance.com:9443/ws}
+      - OLOLON_SYMBOL=${OLOLON_SYMBOL:-btcusdt}
+      - OLOLON_GAMMA_API_URL=${OLOLON_GAMMA_API_URL:-https://gamma-api.polymarket.com}
+      - OLOLON_CLOB_API_URL=${OLOLON_CLOB_API_URL:-https://clob.polymarket.com}
+      - OLOLON_MIN_EDGE=${OLOLON_MIN_EDGE:-0.05}
+      - OLOLON_TRADE_SIZE=${OLOLON_TRADE_SIZE:-10.0}
+      - OLOLON_HIDDEN_SIZE=${OLOLON_HIDDEN_SIZE:-64}
+      - OLOLON_NUM_LAYERS=${OLOLON_NUM_LAYERS:-2}
+      # Polymarket credentials (REQUIRED for live trading)
+      - POLY_PRIVATE_KEY=${POLY_PRIVATE_KEY:-}
+      - POLY_API_KEY=${POLY_API_KEY:-}
+      - POLY_API_SECRET=${POLY_API_SECRET:-}
+      # Dry run mode
+      - DRY_RUN=${DRY_RUN:-1}
+
+  validate:
+    build: .
+    container_name: ololon-validate
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["validate"]
+    profiles:
+      - tools
+    environment:
+      # Global
+      - RUST_LOG=${RUST_LOG:-info}
+      - OLOLON_DATABASE=${OLOLON_DATABASE:-./data/ololon.db}
+      - OLOLON_MODEL=${OLOLON_MODEL:-./data/model.json.gz}
+      # Validate-specific
+      - OLOLON_HIDDEN_SIZE=${OLOLON_HIDDEN_SIZE:-64}

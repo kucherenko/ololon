@@ -421,7 +421,7 @@ pub async fn save_model_metadata(
     Ok(())
 }
 
-/// Get model metadata
+/// Get model metadata - returns (model_path, input_size)
 pub async fn get_model_metadata(conn: &mut SqliteConnection) -> Result<Option<(String, i64)>> {
     let result = ModelMetadata::select()
         .where_("id = ?")
@@ -429,6 +429,16 @@ pub async fn get_model_metadata(conn: &mut SqliteConnection) -> Result<Option<(S
         .fetch_optional(conn)
         .await?;
     Ok(result.map(|m| (m.model_path, m.window_duration_secs)))
+}
+
+/// Get input size from model metadata
+pub async fn get_model_input_size(conn: &mut SqliteConnection) -> Result<Option<i64>> {
+    let result = ModelMetadata::select()
+        .where_("id = ?")
+        .bind(1i64)
+        .fetch_optional(conn)
+        .await?;
+    Ok(result.map(|m| m.window_duration_secs))
 }
 
 /// Get full model metadata including trained_at timestamp

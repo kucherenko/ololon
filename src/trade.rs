@@ -2,11 +2,8 @@
 
 use anyhow::{Context, Result};
 use burn::backend::NdArray;
-use burn::config::Config;
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig, LstmConfig};
 use burn::record::{FullPrecisionSettings, JsonGzFileRecorder};
-use burn::tensor::{backend::Backend, Tensor, TensorData};
 use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -25,6 +22,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
 use crate::db;
+use crate::model::{PriceBatcher, PricePredictorConfig};
 
 type MyBackend = NdArray<f32>;
 
@@ -210,46 +208,6 @@ impl InferenceWindow {
     }
 }
 
-#[derive(Config, Debug)]
-pub struct PricePredictorConfig { pub input_size: usize, pub hidden_size: usize, pub d_output: usize }
-
-impl PricePredictorConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> PricePredictor<B> {
-        let lstm = LstmConfig::new(self.input_size, self.hidden_size, false).init(device);
-        let fc = LinearConfig::new(self.hidden_size, self.d_output).init(device);
-        PricePredictor { lstm, fc, hidden_size: self.hidden_size }
-    }
-}
-
-#[derive(burn::module::Module, Debug)]
-pub struct PricePredictor<B: Backend> { lstm: burn::nn::Lstm<B>, fc: Linear<B>, hidden_size: usize }
-
-impl<B: Backend> PricePredictor<B> {
-    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let (hidden, _) = self.lstm.forward(input, None);
-        let dims = hidden.dims();
-        let last: Tensor<B, 2> = hidden.slice([0..dims[0], dims[1]-1..dims[1], 0..dims[2]]).reshape([dims[0], self.hidden_size]);
-        burn::tensor::activation::sigmoid(self.fc.forward(last)).reshape([dims[0], 1, 1])
-    }
-}
-
-pub struct PriceBatcher<B: Backend> { device: B::Device, #[allow(dead_code)] input_size: usize }
-
-impl<B: Backend> PriceBatcher<B> {
-    pub fn new(device: B::Device, input_size: usize) -> Self { Self { device, input_size } }
-}
-
-pub struct PriceBatch<B: Backend> { pub features: Tensor<B, 3>, #[allow(dead_code)] pub targets: Tensor<B, 1> }
-
-impl<B: Backend> PriceBatcher<B> {
-    pub fn batch(&self, features: Vec<f32>, input_size: usize) -> PriceBatch<B> {
-        PriceBatch {
-            features: Tensor::from_data(TensorData::new(features, [1, 1, input_size]), &self.device),
-            targets: Tensor::from_data(TensorData::new(vec![0.0f32], [1]), &self.device),
-        }
-    }
-}
-
 pub async fn run(config: TradeConfig) -> Result<()> {
     info!(model_path = %config.model_path, "Starting trading bot");
 
@@ -261,11 +219,10 @@ pub async fn run(config: TradeConfig) -> Result<()> {
 
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     let mut conn = db::init_db(&config.db_path).await?;
-    let metadata = db::get_model_metadata(&mut conn).await?;
-    let window_size: usize = metadata.map(|m| m.1 as usize).unwrap_or(59);
+    let input_size: usize = db::get_model_input_size(&mut conn).await?.unwrap_or(59) as usize;
 
-    let model_config = PricePredictorConfig::new(window_size, config.hidden_size, 1);
-    let model = model_config.init::<MyBackend>(&device);
+    let model_config = PricePredictorConfig { input_size, hidden_size: config.hidden_size };
+    let model = model_config.init(&device);
     let recorder = JsonGzFileRecorder::<FullPrecisionSettings>::new();
     let model = model.load_file(&config.model_path, &recorder, &device).context("Failed to load model")?;
 
@@ -277,7 +234,7 @@ pub async fn run(config: TradeConfig) -> Result<()> {
         config.api_secret.as_deref(),
     )?;
 
-    let window = Arc::new(RwLock::new(InferenceWindow::new(window_size + 1)));
+    let window = Arc::new(RwLock::new(InferenceWindow::new(input_size + 1)));
     let last_trade = Arc::new(RwLock::new(0i64));
     let mut interval = interval(Duration::from_secs(30));
 
@@ -305,13 +262,13 @@ pub async fn run(config: TradeConfig) -> Result<()> {
                 drop(w);
                 let Some(feat) = features else { continue; };
 
-                let input_len = feat.len();
-                let batcher = PriceBatcher::<MyBackend>::new(device, input_len);
-                let batch = batcher.batch(feat, input_len);
+                let batcher = PriceBatcher::<MyBackend>::new(device, input_size);
+                let batch = batcher.batch_single(feat);
                 let pred = model.forward(batch.features);
                 let prob = pred.to_data()
                     .as_slice::<f32>()
-                    .map(|s| s.first().copied().unwrap_or(0.5))
+                    .ok()
+                    .and_then(|s| s.first().copied())
                     .unwrap_or(0.5);
 
                 info!(prob_up = format!("{:.4}", prob), "Prediction");

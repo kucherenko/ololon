@@ -609,12 +609,10 @@ async fn settle_trade(
         } else {
             -trade.trade_size * trade.avg_price
         }
+    } else if query.settlement_price < 1.0 {
+        trade.trade_size * (1.0 - trade.avg_price)
     } else {
-        if query.settlement_price < 1.0 {
-            trade.trade_size * (1.0 - trade.avg_price)
-        } else {
-            -trade.trade_size * trade.avg_price
-        }
+        -trade.trade_size * trade.avg_price
     };
 
     // Update the trade
@@ -1016,7 +1014,7 @@ async fn stream_logs(
 
             // File was rotated (size reset or file changed) - send reconnect notice
             if current_size < last_pos {
-                yield Ok(Event::default().data("--- Log file rotated ---".to_string()));
+                yield Ok(Event::default().data("--- Log file rotated ---"));
                 last_pos = 0;
             }
 

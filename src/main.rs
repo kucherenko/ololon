@@ -5,6 +5,7 @@
 
 mod collect;
 mod db;
+mod model;
 mod server;
 mod train;
 mod trade;
